@@ -20,3 +20,4 @@ data/
 dataset/
 pretrained_weight/
 .DS_Store
+app.log
