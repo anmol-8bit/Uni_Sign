@@ -25,6 +25,16 @@ MAX_LEN=256
 ZERO_STAGE=2                  # ZeRO-2 as in config
 DTYPE="bf16"                  # bf16 recommended on Ampere/L4/L40
 QUICK_BREAK=2048              # periodic checkpoint trigger
+
+# --- W&B config (optional) ---
+USE_WANDB=1                   # set 0 to disable
+WANDB_PROJECT="unisign"
+WANDB_ENTITY=""               # set if you use a team/org
+WANDB_RUN_NAME="stage1-pretrain"
+WANDB_GROUP="stage1"
+WANDB_TAGS="pretrain deepspeed bf16"
+WANDB_MODE="online"           # online|offline|disabled
+WANDB_ID=""                   # set to resume a specific run id
 # <<<
 
 mkdir -p "${OUT_DIR}"
@@ -34,17 +44,14 @@ LOGFILE="${OUT_DIR}/train_${TIMESTAMP}.log"
 # Reasonable defaults for a single host, 8x GPUs
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=1
-export NCCL_DEBUG=WARN
 export NCCL_ASYNC_ERROR_HANDLING=1
-export TORCH_SHOW_CPP_STACKTRACES=1
-export PYTHONWARNINGS=ignore                # silence Python warnings
-export TORCH_SHOW_CPP_STACKTRACES=0         # don't try to symbolize C++ stack traces
-export TORCH_DISABLE_ADDR2LINE=1            # hard-disable addr2line calls that print those lines
-export TORCH_CPP_LOG_LEVEL=ERROR            # suppress PyTorch C++ INFO/WARN logs
-export DEEPSPEED_LOG_LEVEL=ERROR            # suppress DeepSpeed INFO config dump
-export NCCL_DEBUG=ERROR 
-# If no Infiniband, avoid wasted probing:
-export NCCL_IB_DISABLE=1
+export PYTHONWARNINGS=ignore
+export TORCH_SHOW_CPP_STACKTRACES=0
+export TORCH_DISABLE_ADDR2LINE=1
+export TORCH_CPP_LOG_LEVEL=ERROR
+export DEEPSPEED_LOG_LEVEL=ERROR
+export NCCL_DEBUG=ERROR
+export NCCL_IB_DISABLE=1  # if you don't have IB
 
 # Optional but helpful on Ampere+:
 python - <<'PY' || true
@@ -54,6 +61,16 @@ try:
 except Exception:
     pass
 PY
+
+# W&B env (launcher level; non-main ranks will be disabled in code)
+if [[ "${USE_WANDB}" == "1" ]]; then
+  export WANDB_MODE="${WANDB_MODE}"
+  [[ -n "${WANDB_ENTITY}" ]] && export WANDB_ENTITY="${WANDB_ENTITY}"
+  export WANDB_PROJECT="${WANDB_PROJECT}"
+fi
+
+WORLD_SIZE=$(( $(tr -cd , <<<"${GPUS}" | wc -c) + 1 ))
+echo "[INFO] Global batch = ${MICRO_BSZ} x ${GRAD_ACCUM} x ${WORLD_SIZE}"
 
 cmd=(
 deepspeed
@@ -79,11 +96,23 @@ deepspeed
     # --rgb_support   # uncomment if using RGB branch
 )
 
+# W&B flags passed to script
+if [[ "${USE_WANDB}" == "1" ]]; then
+  cmd+=( --wandb --wandb-project "${WANDB_PROJECT}" --wandb-run-name "${WANDB_RUN_NAME}" --wandb-group "${WANDB_GROUP}" )
+  [[ -n "${WANDB_ENTITY}" ]] && cmd+=( --wandb-entity "${WANDB_ENTITY}" )
+  [[ -n "${WANDB_TAGS}" ]] && cmd+=( --wandb-tags ${WANDB_TAGS} )
+  [[ -n "${WANDB_MODE}" ]] && cmd+=( --wandb-mode "${WANDB_MODE}" )
+  [[ -n "${WANDB_ID}" ]] && cmd+=( --wandb-id "${WANDB_ID}" )
+fi
+
 echo "[INFO] Launching:"
 printf ' %q' "${cmd[@]}"; echo
 echo "[INFO] Logs -> ${LOGFILE}"
-echo "[INFO] Global batch = ${MICRO_BSZ} x ${GRAD_ACCUM} x $(echo "${GPUS}" | tr -cd , | wc -c | awk '{print $1+1}')"
 
 nohup "${cmd[@]}" > "${LOGFILE}" 2>&1 &
-
+echo $! > "${OUT_DIR}/run.pid"
 echo "[INFO] PID $!   (tail -f ${LOGFILE})"
+
+# helper to stop later:
+# PGID=$(ps -o pgid= -p "$(cat ${OUT_DIR}/run.pid)" | tr -d ' ')
+# kill -TERM -"$PGID"; sleep 3; kill -KILL -"$PGID"
