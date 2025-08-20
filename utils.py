@@ -54,10 +54,13 @@ def is_main_process():
 # -----------------------------
 
 class SmoothedValue(object):
-    """Track a series of values and provide access to smoothed values over a window and the global series average."""
+    """Track a series of values and provide access to smoothed values over a
+    window or the global series average. Safe on empty sequences.
+    """
     def __init__(self, window_size=20, fmt=None):
         if fmt is None:
             fmt = "{median:.4f} ({global_avg:.4f})"
+        from collections import deque
         self.deque = deque(maxlen=window_size)
         self.total = 0.0
         self.count = 0
@@ -69,36 +72,44 @@ class SmoothedValue(object):
         self.total += value * n
 
     def synchronize_between_processes(self):
-        if not is_dist_avail_and_initialized():
+        # no-op if DDP not initialized
+        import torch.distributed as dist
+        import torch
+        if not (dist.is_available() and dist.is_initialized()):
             return
-        # one reduction is enough; no explicit barrier needed
-        t = torch.tensor([self.count, self.total], dtype=torch.float64, device='cuda')
-        tdist.all_reduce(t)
+        t = torch.tensor([self.count, self.total], dtype=torch.float64, device='cuda' if torch.cuda.is_available() else 'cpu')
+        dist.all_reduce(t)
         t = t.tolist()
         self.count = int(t[0])
         self.total = t[1]
 
     @property
     def median(self):
+        import torch
+        if not self.deque:
+            return float('nan')
         d = torch.tensor(list(self.deque))
         return d.median().item()
 
     @property
     def avg(self):
+        import torch
+        if not self.deque:
+            return float('nan')
         d = torch.tensor(list(self.deque), dtype=torch.float32)
         return d.mean().item()
 
     @property
     def global_avg(self):
-        return self.total / max(1, self.count)
+        return self.total / self.count if self.count > 0 else float('nan')
 
     @property
     def max(self):
-        return max(self.deque)
+        return max(self.deque) if self.deque else float('nan')
 
     @property
     def value(self):
-        return self.deque[-1]
+        return self.deque[-1] if self.deque else float('nan')
 
     def __str__(self):
         return self.fmt.format(
@@ -106,7 +117,7 @@ class SmoothedValue(object):
             avg=self.avg,
             global_avg=self.global_avg,
             max=self.max,
-            value=self.value
+            value=self.value,
         )
 
 
@@ -146,6 +157,7 @@ class MetricLogger(object):
         i = 0
         if not header:
             header = ''
+        import time, datetime, torch
         start_time = time.time()
         end = time.time()
         iter_time = SmoothedValue(fmt='{avg:.4f}')
@@ -168,9 +180,11 @@ class MetricLogger(object):
             data_time.update(time.time() - end)
             yield obj
             iter_time.update(time.time() - end)
-            if i % print_freq == 0 or i == len(iterable) - 1:
+
+            # Skip the very first print at i == 0 to avoid empty-meter formatting
+            if ((i > 0 and i % print_freq == 0) or (i == len(iterable) - 1)):
                 eta_seconds = iter_time.global_avg * (len(iterable) - i)
-                eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
+                eta_string = str(datetime.timedelta(seconds=int(eta_seconds))) if eta_seconds == eta_seconds else "N/A"
                 if torch.cuda.is_available():
                     print(log_msg.format(
                         i, len(iterable), eta=eta_string,
@@ -184,11 +198,11 @@ class MetricLogger(object):
                         time=str(iter_time), data=str(data_time)))
             i += 1
             end = time.time()
+
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
         print('{} Total time: {} ({:.4f} s / it)'.format(
-            header, total_time_str, total_time / max(1, len(iterable))
-        ))
+            header, total_time_str, total_time / max(1, len(iterable))))
 
 
 # -----------------------------

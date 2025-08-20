@@ -37,6 +37,12 @@ export OMP_NUM_THREADS=1
 export NCCL_DEBUG=WARN
 export NCCL_ASYNC_ERROR_HANDLING=1
 export TORCH_SHOW_CPP_STACKTRACES=1
+export PYTHONWARNINGS=ignore                # silence Python warnings
+export TORCH_SHOW_CPP_STACKTRACES=0         # don't try to symbolize C++ stack traces
+export TORCH_DISABLE_ADDR2LINE=1            # hard-disable addr2line calls that print those lines
+export TORCH_CPP_LOG_LEVEL=ERROR            # suppress PyTorch C++ INFO/WARN logs
+export DEEPSPEED_LOG_LEVEL=ERROR            # suppress DeepSpeed INFO config dump
+export NCCL_DEBUG=ERROR 
 # If no Infiniband, avoid wasted probing:
 export NCCL_IB_DISABLE=1
 
@@ -53,7 +59,7 @@ cmd=(
 deepspeed
   --include "${GPUS}"
   --master_port "${MASTER_PORT}"
-  pretraining.py
+  pre_training.py
     --dataset "${DATASET}"
     --output_dir "${OUT_DIR}"
     --epochs "${EPOCHS}"
