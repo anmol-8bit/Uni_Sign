@@ -32,13 +32,17 @@ def main(args):
                                   args=args, phase='train')
     print(train_data)
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_data,shuffle=True)
-    train_dataloader = DataLoader(train_data,
-                                 batch_size=args.batch_size, 
-                                 num_workers=args.num_workers, 
-                                 collate_fn=train_data.collate_fn,
-                                 sampler=train_sampler, 
-                                 pin_memory=args.pin_mem,
-                                 drop_last=True)
+    train_dataloader = DataLoader(
+        train_data,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        collate_fn=train_data.collate_fn,
+        sampler=train_sampler,
+        pin_memory=args.pin_mem,
+        drop_last=True,
+        persistent_workers=(args.num_workers > 0),
+        prefetch_factor=4 if args.num_workers > 0 else None,
+    )
 
     dev_data = S2T_Dataset_news(path=dev_label_paths[args.dataset], 
                                 args=args, phase='dev')

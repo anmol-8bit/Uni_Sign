@@ -5,44 +5,56 @@ https://github.com/facebookresearch/deit/blob/main/utils.py
 
 # Copyright (c) 2015-present, Facebook, Inc.
 # All rights reserved.
+
 """
 Misc functions, including distributed helpers.
-
-Mostly copy-paste from torchvision references.
+Mostly copy-paste from torchvision references, adjusted for DeepSpeed.
 """
+
 import io
 import os
-import time,random
+import time, random
 import numpy as np
 from collections import defaultdict, deque
 import datetime
-
-import torch
-import torch.distributed as dist
-import torch.nn.functional as F
-
 import pickle
 import gzip
-
-
-# global definition
-import deepspeed
+import argparse
 
 import torch
 import torch.nn.functional as F
-from torch import Tensor
-import argparse
 import torch.backends.cudnn as cudnn
 
-import deepspeed.comm as dist
+# DeepSpeed / distributed
+import deepspeed
 from deepspeed.accelerator import get_accelerator
+import torch.distributed as tdist
+import deepspeed.comm as ds_dist
 
+
+# -----------------------------
+# Distributed helpers (torch.distributed)
+# -----------------------------
+
+def is_dist_avail_and_initialized():
+    return tdist.is_available() and tdist.is_initialized()
+
+def get_world_size():
+    return tdist.get_world_size() if is_dist_avail_and_initialized() else 1
+
+def get_rank():
+    return tdist.get_rank() if is_dist_avail_and_initialized() else 0
+
+def is_main_process():
+    return get_rank() == 0
+
+
+# -----------------------------
+# Logging / metrics
+# -----------------------------
 
 class SmoothedValue(object):
-    """Track a series of values and provide access to smoothed values over a
-    window or the global series average.
-    """
-
+    """Track a series of values and provide access to smoothed values over a window and the global series average."""
     def __init__(self, window_size=20, fmt=None):
         if fmt is None:
             fmt = "{median:.4f} ({global_avg:.4f})"
@@ -57,14 +69,11 @@ class SmoothedValue(object):
         self.total += value * n
 
     def synchronize_between_processes(self):
-        """
-        Warning: does not synchronize the deque!
-        """
         if not is_dist_avail_and_initialized():
             return
+        # one reduction is enough; no explicit barrier needed
         t = torch.tensor([self.count, self.total], dtype=torch.float64, device='cuda')
-        dist.barrier()
-        dist.all_reduce(t)
+        tdist.all_reduce(t)
         t = t.tolist()
         self.count = int(t[0])
         self.total = t[1]
@@ -81,7 +90,7 @@ class SmoothedValue(object):
 
     @property
     def global_avg(self):
-        return self.total / self.count
+        return self.total / max(1, self.count)
 
     @property
     def max(self):
@@ -97,7 +106,8 @@ class SmoothedValue(object):
             avg=self.avg,
             global_avg=self.global_avg,
             max=self.max,
-            value=self.value)
+            value=self.value
+        )
 
 
 class MetricLogger(object):
@@ -117,15 +127,12 @@ class MetricLogger(object):
             return self.meters[attr]
         if attr in self.__dict__:
             return self.__dict__[attr]
-        raise AttributeError("'{}' object has no attribute '{}'".format(
-            type(self).__name__, attr))
+        raise AttributeError("'{}' object has no attribute '{}'".format(type(self).__name__, attr))
 
     def __str__(self):
         loss_str = []
         for name, meter in self.meters.items():
-            loss_str.append(
-                "{}: {}".format(name, str(meter))
-            )
+            loss_str.append(f"{name}: {meter}")
         return self.delimiter.join(loss_str)
 
     def synchronize_between_processes(self):
@@ -156,6 +163,7 @@ class MetricLogger(object):
             log_msg.append('max mem: {memory:.0f}')
         log_msg = self.delimiter.join(log_msg)
         MB = 1024.0 * 1024.0
+
         for obj in iterable:
             data_time.update(time.time() - end)
             yield obj
@@ -179,65 +187,36 @@ class MetricLogger(object):
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
         print('{} Total time: {} ({:.4f} s / it)'.format(
-            header, total_time_str, total_time / len(iterable)))
+            header, total_time_str, total_time / max(1, len(iterable))
+        ))
+
+
+# -----------------------------
+# Misc helpers
+# -----------------------------
 
 def count_parameters_in_MB(model):
-    # sum(p.numel() for p in model.parameters() if p.requires_grad)
-  return np.sum(np.prod(v.size()) for name, v in model.named_parameters())/1e6
+    return np.sum(np.prod(v.size()) for _, v in model.named_parameters()) / 1e6
 
 def _load_checkpoint_for_ema(model_ema, checkpoint):
-    """
-    Workaround for ModelEma._load_checkpoint to accept an already-loaded object
-    """
+    """Workaround for ModelEma._load_checkpoint to accept an already-loaded object"""
     mem_file = io.BytesIO()
     torch.save(checkpoint, mem_file)
     mem_file.seek(0)
     model_ema._load_checkpoint(mem_file)
 
-
 def setup_for_distributed(is_master):
-    """
-    This function disables printing when not in master process
-    """
+    """Disable printing when not in master process"""
     import builtins as __builtin__
     builtin_print = __builtin__.print
-
     def print(*args, **kwargs):
         force = kwargs.pop('force', False)
         if is_master or force:
             builtin_print(*args, **kwargs)
-
     __builtin__.print = print
 
-
-def is_dist_avail_and_initialized():
-    if not dist.is_available():
-        return False
-    if not dist.is_initialized():
-        return False
-    return True
-
-
-def get_world_size():
-    if not is_dist_avail_and_initialized():
-        return 1
-    return dist.get_world_size()
-
-def get_rank():
-    if not is_dist_avail_and_initialized():
-        return 0
-    return dist.get_rank()
-
-def is_main_process():
-    return get_rank() == 0
-
-def save_on_master(*args, **kwargs):
-    if is_main_process():
-        print("save ckpt begin")
-        torch.save(*args, **kwargs)
-        print("save ckpt finish")
-
 def init_distributed_mode(args):
+    """Torch DDP init (not used when using DeepSpeed-only)"""
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         args.rank = int(os.environ["RANK"])
         args.world_size = int(os.environ['WORLD_SIZE'])
@@ -249,19 +228,17 @@ def init_distributed_mode(args):
         print('Not using distributed mode')
         args.distributed = False
         return
-
     args.distributed = True
-
     torch.cuda.set_device(args.gpu)
     args.dist_backend = 'nccl'
-    print('| distributed init (rank {}): {}'.format(
-        args.rank, args.dist_url), flush=True)
-    torch.distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
-                                         world_size=args.world_size, rank=args.rank)
-    torch.distributed.barrier()
+    print(f'| distributed init (rank {args.rank}): {args.dist_url}', flush=True)
+    tdist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+                             world_size=args.world_size, rank=args.rank)
+    tdist.barrier()
     setup_for_distributed(args.rank == 0)
 
 def init_distributed_mode_ds(args):
+    """DeepSpeed distributed init"""
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         args.rank = int(os.environ["RANK"])
         args.world_size = int(os.environ['WORLD_SIZE'])
@@ -273,34 +250,23 @@ def init_distributed_mode_ds(args):
         print('Not using distributed mode')
         args.distributed = False
         return
-
     args.distributed = True
-
     torch.cuda.set_device(args.gpu)
     args.dist_backend = 'nccl'
-    print('| distributed init (rank {}): {}'.format(
-        args.rank, args.dist_url), flush=True)
-    # torch.distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
-    #                                      world_size=args.world_size, rank=args.rank)
+    print(f'| distributed init (rank {args.rank}): {args.dist_url}', flush=True)
     deepspeed.init_distributed()
-    torch.distributed.barrier()
+    tdist.barrier()
     setup_for_distributed(args.rank == 0)
 
 def sampler_func(clip, sn, random_choice=True):
     if random_choice:
         f = lambda n: [(lambda n, arr: n if arr == [] else np.random.choice(arr))(n * i / sn,
-                                                                                range(int(n * i / sn),
-                                                                                        max(int(n * i / sn) + 1,
-                                                                                            int(n * (
-                                                                                                    i + 1) / sn))))
-                        for i in range(sn)]
+                    range(int(n * i / sn), max(int(n * i / sn) + 1, int(n * (i + 1) / sn))))
+                    for i in range(sn)]
     else:
-        f = lambda n: [(lambda n, arr: n if arr == [] else int(np.mean(arr)))(n * i / sn, range(int(n * i / sn),
-                                                                                                max(int(
-                                                                                                    n * i / sn) + 1,
-                                                                                                    int(n * (
-                                                                                                            i + 1) / sn))))
-                        for i in range(sn)]
+        f = lambda n: [(lambda n, arr: n if arr == [] else int(np.mean(arr)))(n * i / sn,
+                    range(int(n * i / sn), max(int(n * i / sn) + 1, int(n * (i + 1) / sn))))
+                    for i in range(sn)]
     return f(clip)
 
 def cosine_scheduler(base_value, final_value, epochs):
@@ -315,25 +281,27 @@ def cosine_scheduler_func(base_value, final_value, iters, epochs):
 def load_dataset_file(filename):
     with gzip.open(filename, "rb") as f:
         loaded_object = pickle.load(f)
-        return loaded_object
+    return loaded_object
 
 def yield_tokens(file_path):
-    with io.open(file_path, encoding = 'utf-8') as f:
+    with io.open(file_path, encoding='utf-8') as f:
         for line in f:
             yield line.strip().split()
 
 @torch.no_grad()
 def concat_all_gather(tensor):
-    """
-    Performs all_gather operation on the provided tensors.
-    *** Warning ***: torch.distributed.all_gather has no gradient.
-    """
-    tensors_gather = [torch.ones_like(tensor)
-        for _ in range(torch.distributed.get_world_size())]
-    torch.distributed.all_gather(tensors_gather, tensor, async_op=False)
-    
-    output = torch.cat(tensors_gather,dim=0)
-    return output
+    """All-gather for tensors (no grad)."""
+    world = get_world_size()
+    if world == 1:
+        return tensor
+    tensors_gather = [torch.ones_like(tensor) for _ in range(world)]
+    tdist.all_gather(tensors_gather, tensor, async_op=False)
+    return torch.cat(tensors_gather, dim=0)
+
+
+# -----------------------------
+# DeepSpeed config / init
+# -----------------------------
 
 def get_train_ds_config(offload,
                         dtype,
@@ -349,7 +317,6 @@ def get_train_ds_config(offload,
                         tb_path="",
                         tb_name="",
                         args=''):
-
     device = "cpu" if offload else "none"
     data_type = "fp16"
     dtype_config = {"enabled": False}
@@ -360,27 +327,26 @@ def get_train_ds_config(offload,
     elif dtype == "bf16":
         data_type = "bfloat16"
         dtype_config = {"enabled": True}
+
     zero_opt_dict = {
         "stage": stage,
-        "offload_param": {
-            "device": device
-        },
-        "offload_optimizer": {
-            "device": device
-        },
+        "offload_param": {"device": device},
+        "offload_optimizer": {"device": device},
         "stage3_param_persistence_threshold": 1e4,
         "stage3_max_live_parameters": 3e7,
         "stage3_prefetch_bucket_size": 3e7,
         "memory_efficient_linear": False
     }
-    
+
     if enable_mixed_precision_lora:
         zero_opt_dict["zero_quantized_nontrainable_weights"] = True
-        if dist.get_world_size() != get_accelerator().device_count():
-            zero_opt_dict["zero_hpz_partition_size"] = get_accelerator(
-            ).device_count()
+        if is_dist_avail_and_initialized() and tdist.get_world_size() != get_accelerator().device_count():
+            zero_opt_dict["zero_hpz_partition_size"] = get_accelerator().device_count()
+
+    steps_per_print = getattr(args, "print_freq", 50) if hasattr(args, "__dict__") else 50
+
     return {
-        "steps_per_print": 10,
+        "steps_per_print": steps_per_print,
         "zero_optimization": zero_opt_dict,
         data_type: dtype_config,
         "gradient_clipping": 1.0,
@@ -402,42 +368,41 @@ def get_train_ds_config(offload,
     }
 
 def init_deepspeed(args, model, optimizer, lr_scheduler):
-
     ds_config = get_train_ds_config(
         offload=args.offload,
         dtype=args.dtype,
         stage=args.zero_stage,
-        args=args
+        args=args,
     )
-
     ds_config['train_micro_batch_size_per_gpu'] = args.batch_size
     ds_config['gradient_accumulation_steps'] = args.gradient_accumulation_steps
     ds_config['gradient_clipping'] = args.gradient_clipping
 
-    use_deepspeed = True
-    if use_deepspeed:
-        print("Using deepspeed to train...")
-        print("Initializing deepspeed...")
-        _wrapped_model, _optimizer, _, _lr_sched = deepspeed.initialize(
-            model=model,
-            optimizer=optimizer,
-            args=args,
-            config=ds_config,
-            lr_scheduler=lr_scheduler,
-            dist_init_required=True)
-    
+    print("Using deepspeed to train...")
+    print("Initializing deepspeed...")
+    _wrapped_model, _optimizer, _, _lr_sched = deepspeed.initialize(
+        model=model,
+        optimizer=optimizer,
+        args=args,
+        config=ds_config,
+        lr_scheduler=lr_scheduler,
+        dist_init_required=True
+    )
     return _wrapped_model, _optimizer, _lr_sched
+
+
+# -----------------------------
+# Repro/args
+# -----------------------------
 
 def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
     np.random.seed(seed)
     random.seed(seed)
-    
-    cudnn.deterministic = True # Since the input dim is dynamic.
-    cudnn.benchmark = False # Since the input dim is dynamic.
+    cudnn.deterministic = True  # dynamic input dims
+    cudnn.benchmark = False     # dynamic input dims
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Uni-Sign scripts', add_help=False)
@@ -447,17 +412,21 @@ def get_args_parser():
     parser.add_argument('--epochs', default=20, type=int)
 
     # distributed training parameters
-    parser.add_argument('--world_size', default=1, type=int,
-                        help='number of distributed processes')
+    parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
     parser.add_argument('--local_rank', default=0, type=int)
     parser.add_argument('--local-rank', default=0, type=int)
     parser.add_argument("--hidden_dim", default=256, type=int)
 
-    # * Finetuning params
+    # logging / dataloader
+    parser.add_argument('--print-freq', default=50, type=int, help='Steps between logs')
+    parser.add_argument('--prefetch-factor', default=4, type=int, help='DataLoader prefetch factor')
+    parser.add_argument('--persistent-workers', action='store_true', help='Use persistent DataLoader workers')
+
+    # Finetuning
     parser.add_argument('--finetune', default='', help='finetune from checkpoint')
 
-    # * Optimizer parameters
+    # Optimizer
     parser.add_argument('--opt', default='adamw', type=str, metavar='OPTIMIZER',
                         help='Optimizer (default: "adamw"')
     parser.add_argument('--opt-eps', default=1.0e-09, type=float, metavar='EPSILON',
@@ -468,67 +437,45 @@ def get_args_parser():
                         help='Clip gradient norm (default: None, no clipping)')
     parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
                         help='SGD momentum (default: 0.9)')
-    parser.add_argument('--weight-decay', type=float, default=0.0001,
-                        help='weight decay (default: 0.05)')
-    
+    parser.add_argument('--weight-decay', type=float, default=0.0001, help='weight decay')
+
+    # Scheduler
     parser.add_argument('--sched', default='cosine', type=str, metavar='SCHEDULER',
                         help='LR scheduler (default: "cosine"')
-    parser.add_argument('--lr', type=float, default=1.0e-3, metavar='LR',
-                        help='learning rate (default: 5e-4)')
-    parser.add_argument('--min-lr', type=float, default=1.0e-08, metavar='LR',
-                        help='lower lr bound for cyclic schedulers that hit 0 (1e-5)')
-    parser.add_argument('--warmup-epochs', type=float, default=0, metavar='N',
-                        help='epochs to warmup LR, if scheduler supports')
+    parser.add_argument('--lr', type=float, default=1.0e-3, metavar='LR')
+    parser.add_argument('--min-lr', type=float, default=1.0e-08, metavar='LR')
+    parser.add_argument('--warmup-epochs', type=float, default=0, metavar='N')
 
-     # * Baise params
-    parser.add_argument('--output_dir', default='',
-                        help='path where to save, empty for no saving')
+    # Base params
+    parser.add_argument('--output_dir', default='', help='path where to save, empty for no saving')
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--eval', action='store_true', help='Perform evaluation only')
     parser.add_argument('--num_workers', default=8, type=int)
     parser.add_argument('--pin-mem', action='store_true',
-                        help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
-    parser.add_argument('--no-pin-mem', action='store_false', dest='pin_mem',
-                        help='')
+                        help='Pin CPU memory in DataLoader for more efficient transfer to GPU.')
+    parser.add_argument('--no-pin-mem', action='store_false', dest='pin_mem', help='')
     parser.set_defaults(pin_mem=True)
 
-    # deepspeed features
-    parser.add_argument('--offload',
-                        action='store_true',
-                        help='Enable ZeRO Offload techniques.')
-    parser.add_argument('--dtype',
-                        type=str,
-                        default='bf16',
-                        choices=['fp16', 'bf16'],
-                        help='Training data type')
-    parser.add_argument('--zero_stage',
-                        type=int,
-                        default=2,
-                        help='ZeRO optimization stage for Actor model (and clones).')
-    ## low precision
-    parser.add_argument('--compute_fp32_loss',
-                        action='store_true',
-                        help='Relevant for low precision dtypes (fp16, bf16, etc.). '
-                        'If specified, loss is calculated in fp32.')
-    
-    parser.add_argument('--quick_break',
-                        type=int,
-                        default=0,
-                        help='save ckpt per quick_break step')
-    
+    # DeepSpeed features
+    parser.add_argument('--offload', action='store_true', help='Enable ZeRO Offload techniques.')
+    parser.add_argument('--dtype', type=str, default='bf16', choices=['fp16', 'bf16'], help='Training data type')
+    parser.add_argument('--zero_stage', type=int, default=2, help='ZeRO optimization stage')
+    parser.add_argument('--compute_fp32_loss', action='store_true',
+                        help='If specified, calculate loss in fp32 for low precision dtypes.')
+
+    parser.add_argument('--quick_break', type=int, default=0, help='save ckpt per quick_break step')
+
     # RGB branch
-    parser.add_argument('--rgb_support', action='store_true',)
-    
+    parser.add_argument('--rgb_support', action='store_true')
+
     # Pose length
     parser.add_argument("--max_length", default=256, type=int)
-    
-    # select dataset
+
+    # dataset / task
     parser.add_argument("--dataset", default="CSL_Daily", choices=['CSL_News', "CSL_Daily", "WLASL"])
-    
-    # select task
     parser.add_argument("--task", default="SLT", choices=['SLT', "ISLR", "CSLR"])
-    
-    # select label smooth
+
+    # label smoothing
     parser.add_argument("--label_smoothing", default=0.2, type=float)
 
     # online inference

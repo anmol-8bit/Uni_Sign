@@ -1,25 +1,25 @@
-
-from pickletools import optimize
-import torch
-from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import DataLoader
-
-from models import Uni_Sign
-import utils as utils
-from datasets import S2T_Dataset_news
-
 import os
-import time
-import argparse, json, datetime
-from pathlib import Path
-import math
 import sys
-from timm.optim import create_optimizer
-from models import get_requires_grad_dict
-from transformers import get_scheduler
-from SLRT_metrics import translation_performance
-from config import *
+import math
+import time
+import json
+import datetime
+from pathlib import Path
 from typing import Iterable, Optional
+
+import torch
+from torch.utils.data import DataLoader
+from torch.nn.utils.rnn import pad_sequence  # (kept if you need elsewhere)
+
+from timm.optim import create_optimizer
+from transformers import get_scheduler
+
+import utils as utils
+from models import Uni_Sign, get_requires_grad_dict
+from datasets import S2T_Dataset_news
+from SLRT_metrics import translation_performance
+from config import *  # train_label_paths, dev_label_paths
+
 
 def main(args):
     utils.init_distributed_mode_ds(args)
@@ -27,101 +27,90 @@ def main(args):
     print(args)
     utils.set_seed(args.seed)
 
-    print(f"Creating dataset:")
-    train_data = S2T_Dataset_news(path=train_label_paths[args.dataset], 
-                                  args=args, phase='train')
+    print("Creating dataset:")
+    train_data = S2T_Dataset_news(path=train_label_paths[args.dataset], args=args, phase='train')
     print(train_data)
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_data,shuffle=True)
-    train_dataloader = DataLoader(train_data,
-                                 batch_size=args.batch_size, 
-                                 num_workers=args.num_workers, 
-                                 collate_fn=train_data.collate_fn,
-                                 sampler=train_sampler, 
-                                 pin_memory=args.pin_mem,
-                                 drop_last=True)
+    train_sampler = torch.utils.data.distributed.DistributedSampler(train_data, shuffle=True)
+    train_dataloader = DataLoader(
+        train_data,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        collate_fn=train_data.collate_fn,
+        sampler=train_sampler,
+        pin_memory=args.pin_mem,
+        drop_last=True,
+        persistent_workers=(args.persistent_workers and args.num_workers > 0),
+        prefetch_factor=(args.prefetch_factor if args.num_workers > 0 else None),
+    )
 
-    dev_data = S2T_Dataset_news(path=dev_label_paths[args.dataset], 
-                                args=args, phase='dev')
+    dev_data = S2T_Dataset_news(path=dev_label_paths[args.dataset], args=args, phase='dev')
     print(dev_data)
-    dev_sampler = torch.utils.data.distributed.DistributedSampler(dev_data,shuffle=False)
-    dev_dataloader = DataLoader(dev_data,
-                                 batch_size=args.batch_size,
-                                 num_workers=args.num_workers, 
-                                 collate_fn=dev_data.collate_fn,
-                                 sampler=dev_sampler, 
-                                 pin_memory=args.pin_mem)
+    dev_sampler = torch.utils.data.distributed.DistributedSampler(dev_data, shuffle=False)
+    dev_dataloader = DataLoader(
+        dev_data,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        collate_fn=dev_data.collate_fn,
+        sampler=dev_sampler,
+        pin_memory=args.pin_mem,
+        persistent_workers=(args.persistent_workers and args.num_workers > 0),
+        prefetch_factor=(args.prefetch_factor if args.num_workers > 0 else None),
+    )
 
-    print(f"Creating model:")
-    model = Uni_Sign(
-                    args=args,
-                    )
-    model.cuda()
-    model.train()
-    for param in model.parameters():
-        if param.requires_grad:
-            param.data = param.data.to(torch.float32)
+    print("Creating model:")
+    model = Uni_Sign(args=args).cuda().train()
 
     if args.finetune != '':
         print('***********************************')
         print('Load Checkpoint...')
         print('***********************************')
         state_dict = torch.load(args.finetune, map_location='cpu')['model']
-
         ret = model.load_state_dict(state_dict, strict=False)
         print('Missing keys: \n', '\n'.join(ret.missing_keys))
         print('Unexpected keys: \n', '\n'.join(ret.unexpected_keys))
-    
 
     model_without_ddp = model
-    if args.distributed:
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
-        model_without_ddp = model.module
+
     n_parameters = utils.count_parameters_in_MB(model_without_ddp)
     print(f'number of params: {n_parameters}M')
 
     optimizer = create_optimizer(args, model_without_ddp)
-    
+
     if args.quick_break <= 0:
         args.quick_break = len(train_dataloader)
 
     lr_scheduler = get_scheduler(
-                name='cosine',
-                optimizer=optimizer,
-                num_warmup_steps=int(args.warmup_epochs * len(train_dataloader)/args.gradient_accumulation_steps),
-                num_training_steps=int(args.epochs * len(train_dataloader)/args.gradient_accumulation_steps),
-            )
-    
+        name='cosine',
+        optimizer=optimizer,
+        num_warmup_steps=int(args.warmup_epochs * len(train_dataloader) / args.gradient_accumulation_steps),
+        num_training_steps=int(args.epochs * len(train_dataloader) / args.gradient_accumulation_steps),
+    )
+
     model, optimizer, lr_scheduler = utils.init_deepspeed(args, model, optimizer, lr_scheduler)
-    model_without_ddp = model.module.module
-    # print(model_without_ddp)
-    print(optimizer)
+    model_without_ddp = model.module  # DeepSpeed engine -> underlying module
 
     output_dir = Path(args.output_dir)
-
     start_time = time.time()
     max_accuracy = 0
 
     if args.eval:
         if utils.is_main_process():
             print("📄 test result")
-            test_stats = evaluate(args, dev_dataloader, model, model_without_ddp)
+            _ = evaluate(args, dev_dataloader, model, model_without_ddp)
+        return
 
-        return 
     print(f"Start training for {args.epochs} epochs")
-
     for epoch in range(0, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        
+
         train_stats = train_one_epoch(args, model, train_dataloader, optimizer, epoch, model_without_ddp=model_without_ddp)
 
         if args.output_dir:
             checkpoint_paths = [output_dir / f'checkpoint_{epoch}.pth']
             for checkpoint_path in checkpoint_paths:
-                utils.save_on_master({
-                    'model': get_requires_grad_dict(model_without_ddp),
-                }, checkpoint_path)
+                utils.save_on_master({'model': get_requires_grad_dict(model_without_ddp)}, checkpoint_path)
+
         test_stats = evaluate(args, dev_dataloader, model, model_without_ddp)
         print(f"BLEU-4 of the network on the {len(dev_dataloader)} dev videos: {test_stats['bleu4']:.2f}")
 
@@ -130,144 +119,141 @@ def main(args):
             if args.output_dir and utils.is_main_process():
                 checkpoint_paths = [output_dir / 'best_checkpoint.pth']
                 for checkpoint_path in checkpoint_paths:
-                    utils.save_on_master({
-                        'model': get_requires_grad_dict(model_without_ddp),
-                    }, checkpoint_path)
-            
+                    utils.save_on_master({'model': get_requires_grad_dict(model_without_ddp)}, checkpoint_path)
+
         print(f'Max BLEU-4: {max_accuracy:.2f}%')
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      **{f'test_{k}': v for k, v in test_stats.items()},
                      'epoch': epoch,
                      'n_parameters': n_parameters}
-        
+
         if args.output_dir and utils.is_main_process():
             with (output_dir / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
-        
+
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
+
 
 def train_one_epoch(args, model, data_loader, optimizer, epoch, model_without_ddp):
     model.train()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
-    print_freq = 10
+    header = f'Epoch: [{epoch}/{args.epochs}]'
+    print_freq = getattr(args, "print_freq", 50)
+
     optimizer.zero_grad()
 
-    target_dtype = None
-    if model.bfloat16_enabled():
-        target_dtype = torch.bfloat16
+    target_dtype = torch.bfloat16 if model.bfloat16_enabled() else None
+    dev_index = args.gpu if hasattr(args, "gpu") and torch.cuda.is_available() else torch.cuda.current_device() if torch.cuda.is_available() else None
+    device = torch.device(f"cuda:{dev_index}") if dev_index is not None else torch.device("cpu")
+
+    running_loss = torch.zeros((), device=device)
+    running_count = 0
 
     for step, (src_input, tgt_input) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-        if (step + 1) % args.quick_break == 0:
-            if args.output_dir:
-                output_dir = Path(args.output_dir)
-                checkpoint_paths = [output_dir / f'checkpoint.pth']
-                for checkpoint_path in checkpoint_paths:
-                    utils.save_on_master({
-                        'model': get_requires_grad_dict(model_without_ddp),
-                    }, checkpoint_path)
+        if (step + 1) % args.quick_break == 0 and args.output_dir:
+            output_dir = Path(args.output_dir)
+            checkpoint_paths = [output_dir / f'checkpoint.pth']
+            for checkpoint_path in checkpoint_paths:
+                utils.save_on_master({'model': get_requires_grad_dict(model_without_ddp)}, checkpoint_path)
 
-        if target_dtype != None:
-            for key in src_input.keys():
-                if isinstance(src_input[key], torch.Tensor):
-                    src_input[key] = src_input[key].to(target_dtype).cuda()
+        # Move to device; only cast float tensors
+        for k, v in list(src_input.items()):
+            if isinstance(v, torch.Tensor):
+                v = v.to(device, non_blocking=True)
+                if target_dtype is not None and v.is_floating_point():
+                    v = v.to(target_dtype)
+                src_input[k] = v
 
         stack_out = model(src_input, tgt_input)
-        
         total_loss = stack_out['loss']
+
+        if not torch.isfinite(total_loss.detach()).all():
+            print("Loss is NaN/Inf, stopping training")
+            sys.exit(1)
+
         model.backward(total_loss)
         model.step()
 
-        loss_value = total_loss.item()
-        if not math.isfinite(loss_value):
-            print("Loss is {}, stopping training".format(loss_value))
-            sys.exit(1)
-            
-        metric_logger.update(loss=loss_value)
-        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+        running_loss += total_loss.detach()
+        running_count += 1
 
-    # gather the stats from all processes
+        if (step + 1) % print_freq == 0 or (step + 1) == len(data_loader):
+            loss_val = (running_loss / max(1, running_count)).float().item()
+            metric_logger.update(loss=loss_val, lr=optimizer.param_groups[0]["lr"])
+            running_loss.zero_()
+            running_count = 0
+
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
-    return  {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 def evaluate(args, data_loader, model, model_without_ddp):
     model.eval()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
+    print_freq = getattr(args, "print_freq", 50)
 
-    target_dtype = None
-    if model.bfloat16_enabled():
-        target_dtype = torch.bfloat16
-        
+    target_dtype = torch.bfloat16 if model.bfloat16_enabled() else None
+    dev_index = args.gpu if hasattr(args, "gpu") and torch.cuda.is_available() else torch.cuda.current_device() if torch.cuda.is_available() else None
+    device = torch.device(f"cuda:{dev_index}") if dev_index is not None else torch.device("cpu")
+
     with torch.no_grad():
-        tgt_pres = []
-        tgt_refs = []
- 
-        for step, (src_input, tgt_input) in enumerate(metric_logger.log_every(data_loader, 10, header)):
-            if target_dtype != None:
-                for key in src_input.keys():
-                    if isinstance(src_input[key], torch.Tensor):
-                        src_input[key] = src_input[key].to(target_dtype).cuda()
-            
+        preds = []
+        refs = []
+
+        for step, (src_input, tgt_input) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+            for k, v in list(src_input.items()):
+                if isinstance(v, torch.Tensor):
+                    v = v.to(device, non_blocking=True)
+                    if target_dtype is not None and v.is_floating_point():
+                        v = v.to(target_dtype)
+                    src_input[k] = v
+
             stack_out = model(src_input, tgt_input)
             total_loss = stack_out['loss']
-            metric_logger.update(loss=total_loss.item())
-        
-            output = model_without_ddp.generate(stack_out, 
-                                                max_new_tokens=100, 
-                                                num_beams = 4,
-                        )
+            metric_logger.update(loss=total_loss.detach().float().item())
 
-            for i in range(len(output)):
-                tgt_pres.append(output[i])
-                tgt_refs.append(tgt_input['gt_sentence'][i])
+            output = model_without_ddp.generate(stack_out, max_new_tokens=100, num_beams=4)
+            decoded = model_without_ddp.mt5_tokenizer.batch_decode(output, skip_special_tokens=True)
 
-    tokenizer = model_without_ddp.mt5_tokenizer
-    padding_value = tokenizer.eos_token_id
-    
-    pad_tensor = torch.ones(150-len(tgt_pres[0])).cuda() * padding_value
-    tgt_pres[0] = torch.cat((tgt_pres[0],pad_tensor.long()),dim = 0)
+            preds.extend(decoded)
+            refs.extend(tgt_input['gt_sentence'])
 
-    tgt_pres = pad_sequence(tgt_pres,batch_first=True,padding_value=padding_value)
-    tgt_pres = tokenizer.batch_decode(tgt_pres, skip_special_tokens=True)
-            
     if args.dataset == 'CSL_News':
-        tgt_pres = [' '.join(list(r.replace(" ",'').replace("\n",''))) for r in tgt_pres]
-        tgt_refs = [' '.join(list(r.replace("，", ',').replace("？","?").replace(" ",''))) for r in tgt_refs]
+        preds = [' '.join(list(r.replace(" ", '').replace("\n", ''))) for r in preds]
+        refs  = [' '.join(list(r.replace("，", ',').replace("？", "?").replace(" ", ''))) for r in refs]
 
-    bleu_dict, rouge_score = translation_performance(tgt_refs, tgt_pres)
-    for k,v in bleu_dict.items():
+    bleu_dict, rouge_score = translation_performance(refs, preds)
+    for k, v in bleu_dict.items():
         metric_logger.meters[k].update(v)
     metric_logger.meters['rouge'].update(rouge_score)
 
-    # gather the stats from all processes
     metric_logger.synchronize_between_processes()
-    print('* BLEU-4 {top1.global_avg:.3f} loss {losses.global_avg:.3f}'
-          .format(top1=metric_logger.bleu4, losses=metric_logger.loss))
-    
-    if utils.is_main_process() and utils.get_world_size() == 1 and args.eval:
-        with open(args.output_dir+'/tmp_pres.txt','w') as f:
-            for i in range(len(tgt_pres)):
-                f.write(tgt_pres[i]+'\n')
-        with open(args.output_dir+'/tmp_refs.txt','w') as f:
-            for i in range(len(tgt_refs)):
-                f.write(tgt_refs[i]+'\n')
+    print('* BLEU-4 {top1.global_avg:.3f} loss {losses.global_avg:.3f}'.format(
+        top1=metric_logger.bleu4, losses=metric_logger.loss))
+
+    if utils.is_main_process() and utils.get_world_size() == 1 and args.eval and args.output_dir:
+        with open(os.path.join(args.output_dir, 'tmp_pres.txt'), 'w') as f:
+            for s in preds:
+                f.write(s + '\n')
+        with open(os.path.join(args.output_dir, 'tmp_refs.txt'), 'w') as f:
+            for s in refs:
+                f.write(s + '\n')
 
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
+
 if __name__ == '__main__':
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
+    import argparse
     parser = argparse.ArgumentParser('Uni-Sign scripts', parents=[utils.get_args_parser()])
     args = parser.parse_args()
-    
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)
