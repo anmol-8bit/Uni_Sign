@@ -22,35 +22,48 @@ from datasets_augmentations import apply_pose_augmentations
 # Pose utilities
 # -----------------------------
 def load_part_kp(skeletons, confs, force_ok=False):
+    import numpy as np, torch
     thr = 0.3
     kps_with_scores = {}
     scale = None
 
-    for part in ['body', 'left', 'right', 'face_all']:
-        kps = []
-        confidences = []
+    def _to_np_frame(x):
+        a = np.asarray(x)
+        if a.ndim == 3 and a.shape[0] == 1:  # (1,133,2) -> (133,2)
+            a = a[0]
+        return a
 
+    def _to_np_conf(x):
+        a = np.asarray(x)
+        if a.ndim == 2 and a.shape[0] == 1:  # (1,133) -> (133,)
+            a = a[0]
+        return a
+
+    for part in ['body', 'left', 'right', 'face_all']:
+        kps, confidences = [], []
         for skeleton, conf in zip(skeletons, confs):
-            skeleton = skeleton[0]
-            conf = conf[0]
+            skeleton = _to_np_frame(skeleton)  # <- converts list/array to ndarray
+            conf     = _to_np_conf(conf)
 
             if part == 'body':
-                hand_kp2d = skeleton[[0] + [i for i in range(3, 11)], :]
-                confidence = conf[[0] + [i for i in range(3, 11)]]
+                idx = [0] + list(range(3, 11))
+                hand_kp2d = skeleton[idx, :]
+                confidence = conf[idx]
             elif part == 'left':
-                hand_kp2d = skeleton[91:112, :]
-                hand_kp2d = hand_kp2d - hand_kp2d[0, :]
+                hand_kp2d = skeleton[91:112, :].copy()
+                hand_kp2d -= hand_kp2d[0, :]
                 confidence = conf[91:112]
             elif part == 'right':
-                hand_kp2d = skeleton[112:133, :]
-                hand_kp2d = hand_kp2d - hand_kp2d[0, :]
+                hand_kp2d = skeleton[112:133, :].copy()
+                hand_kp2d -= hand_kp2d[0, :]
                 confidence = conf[112:133]
-            elif part == 'face_all':
-                hand_kp2d = skeleton[[i for i in list(range(23, 23 + 17))[::2]] + [i for i in range(83, 83 + 8)] + [53], :]
-                hand_kp2d = hand_kp2d - hand_kp2d[-1, :]
-                confidence = conf[[i for i in list(range(23, 23 + 17))[::2]] + [i for i in range(83, 83 + 8)] + [53]]
-            else:
-                raise NotImplementedError
+            else:  # face_all
+                face_idxs = list(range(23, 23+17))[::2]
+                brow_idxs = list(range(83, 83+8))
+                idx = face_idxs + brow_idxs + [53]
+                hand_kp2d = skeleton[idx, :].copy()
+                hand_kp2d -= hand_kp2d[-1, :]
+                confidence = conf[idx]
 
             kps.append(hand_kp2d)
             confidences.append(confidence)
@@ -64,14 +77,15 @@ def load_part_kp(skeletons, confs, force_ok=False):
             assert scale is not None
             result = np.concatenate([kps, confidences[..., None]], axis=-1)
             if scale == 0:
-                result = np.zeros(result.shape)
+                result = np.zeros_like(result)
             else:
-                result[..., :2] = (result[..., :2]) / scale
+                result[..., :2] /= scale
                 result = np.clip(result, -1, 1)
-                result[result[..., 2] <= thr] = 0  # mask low-conf
+                result[result[..., 2] <= thr] = 0
         kps_with_scores[part] = torch.tensor(result)
 
     return kps_with_scores
+
 
 
 def crop_scale(motion, thr):

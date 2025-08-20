@@ -110,7 +110,8 @@ class SignLanguageAugmentation:
         if random.random() < 0.3:
             skeleton_array, conf_array = self._apply_keypoint_dropout(skeleton_array, conf_array)
 
-        return skeleton_array.tolist(), conf_array.tolist()
+        # return skeleton_array.tolist(), conf_array.tolist()
+        return skeleton_array, conf_array
 
     def _apply_translation(self, skeleton_array: np.ndarray) -> np.ndarray:
         valid_points = skeleton_array[skeleton_array[..., 0] != 0]
