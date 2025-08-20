@@ -1,3 +1,4 @@
+# utils.py
 """
 This file is modified from:
 https://github.com/facebookresearch/deit/blob/main/utils.py
@@ -29,7 +30,6 @@ import torch.backends.cudnn as cudnn
 import deepspeed
 from deepspeed.accelerator import get_accelerator
 import torch.distributed as tdist
-import deepspeed.comm as ds_dist
 
 
 # -----------------------------
@@ -50,6 +50,70 @@ def is_main_process():
 
 
 # -----------------------------
+# W&B helpers (safe no-op when disabled)
+# -----------------------------
+
+def init_wandb(args, config):
+    """
+    Initialize Weights & Biases on rank-0 only.
+    Returns a wandb run object or None.
+    """
+    if not getattr(args, "wandb", False):
+        return None
+    mode = getattr(args, "wandb_mode", None)
+    if mode == "disabled":
+        return None
+
+    if not is_main_process():
+        # ensure non-main ranks don't try to start a run
+        os.environ["WANDB_MODE"] = "disabled"
+
+    try:
+        import wandb
+    except Exception:
+        if is_main_process():
+            print("[W&B] wandb not installed; skipping.")
+        return None
+
+    # honor explicit mode if given
+    if mode in ("online", "offline"):
+        os.environ["WANDB_MODE"] = mode
+
+    run = wandb.init(
+        project=getattr(args, "wandb_project", "unisign"),
+        entity=getattr(args, "wandb_entity", None),
+        name=getattr(args, "wandb_run_name", None),
+        group=getattr(args, "wandb_group", None),
+        tags=getattr(args, "wandb_tags", None),
+        id=getattr(args, "wandb_id", None),
+        resume="allow" if getattr(args, "wandb_id", None) else None,
+        config=config,
+        reinit=False,
+        settings=wandb.Settings(start_method="thread"),
+    )
+    return run
+
+def wandb_log(run, metrics: dict, step: int | None = None, commit: bool = True):
+    if run is None:
+        return
+    if not is_main_process():
+        return
+    try:
+        run.log(metrics, step=step, commit=commit)
+    except Exception:
+        pass
+
+def wandb_watch(run, model, log: str = "gradients", log_freq: int = 250):
+    if run is None or not is_main_process():
+        return
+    try:
+        import wandb
+        wandb.watch(model, log=log, log_freq=log_freq)
+    except Exception:
+        pass
+
+
+# -----------------------------
 # Logging / metrics
 # -----------------------------
 
@@ -60,7 +124,6 @@ class SmoothedValue(object):
     def __init__(self, window_size=20, fmt=None):
         if fmt is None:
             fmt = "{median:.4f} ({global_avg:.4f})"
-        from collections import deque
         self.deque = deque(maxlen=window_size)
         self.total = 0.0
         self.count = 0
@@ -72,20 +135,17 @@ class SmoothedValue(object):
         self.total += value * n
 
     def synchronize_between_processes(self):
-        # no-op if DDP not initialized
-        import torch.distributed as dist
-        import torch
-        if not (dist.is_available() and dist.is_initialized()):
+        if not is_dist_avail_and_initialized():
             return
-        t = torch.tensor([self.count, self.total], dtype=torch.float64, device='cuda' if torch.cuda.is_available() else 'cpu')
-        dist.all_reduce(t)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        t = torch.tensor([self.count, self.total], dtype=torch.float64, device=device)
+        tdist.all_reduce(t)
         t = t.tolist()
         self.count = int(t[0])
         self.total = t[1]
 
     @property
     def median(self):
-        import torch
         if not self.deque:
             return float('nan')
         d = torch.tensor(list(self.deque))
@@ -93,7 +153,6 @@ class SmoothedValue(object):
 
     @property
     def avg(self):
-        import torch
         if not self.deque:
             return float('nan')
         d = torch.tensor(list(self.deque), dtype=torch.float32)
@@ -157,7 +216,6 @@ class MetricLogger(object):
         i = 0
         if not header:
             header = ''
-        import time, datetime, torch
         start_time = time.time()
         end = time.time()
         iter_time = SmoothedValue(fmt='{avg:.4f}')
@@ -181,8 +239,7 @@ class MetricLogger(object):
             yield obj
             iter_time.update(time.time() - end)
 
-            # Skip the very first print at i == 0 to avoid empty-meter formatting
-            if ((i > 0 and i % print_freq == 0) or (i == len(iterable) - 1)):
+            if (i > 0 and i % print_freq == 0) or (i == len(iterable) - 1):
                 eta_seconds = iter_time.global_avg * (len(iterable) - i)
                 eta_string = str(datetime.timedelta(seconds=int(eta_seconds))) if eta_seconds == eta_seconds else "N/A"
                 if torch.cuda.is_available():
@@ -219,15 +276,16 @@ def _load_checkpoint_for_ema(model_ema, checkpoint):
     mem_file.seek(0)
     model_ema._load_checkpoint(mem_file)
 
-def setup_for_distributed(is_master):
+def setup_for_distributed(is_master_flag):
     """Disable printing when not in master process"""
     import builtins as __builtin__
     builtin_print = __builtin__.print
     def print(*args, **kwargs):
         force = kwargs.pop('force', False)
-        if is_master or force:
+        if is_master_flag or force:
             builtin_print(*args, **kwargs)
     __builtin__.print = print
+
 
 def init_distributed_mode(args):
     """Torch DDP init (not used when using DeepSpeed-only)"""
@@ -351,11 +409,6 @@ def get_train_ds_config(offload,
         "stage3_prefetch_bucket_size": 3e7,
         "memory_efficient_linear": False
     }
-
-    if enable_mixed_precision_lora:
-        zero_opt_dict["zero_quantized_nontrainable_weights"] = True
-        if is_dist_avail_and_initialized() and tdist.get_world_size() != get_accelerator().device_count():
-            zero_opt_dict["zero_hpz_partition_size"] = get_accelerator().device_count()
 
     steps_per_print = getattr(args, "print_freq", 50) if hasattr(args, "__dict__") else 50
 
@@ -494,5 +547,16 @@ def get_args_parser():
 
     # online inference
     parser.add_argument("--online_video", default="", type=str)
+
+    # ---- W&B flags ----
+    parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
+    parser.add_argument('--wandb-project', type=str, default='unisign', help='W&B project')
+    parser.add_argument('--wandb-entity', type=str, default=None, help='W&B entity/org')
+    parser.add_argument('--wandb-run-name', type=str, default=None, help='Run name')
+    parser.add_argument('--wandb-group', type=str, default=None, help='Group name')
+    parser.add_argument('--wandb-tags', nargs='*', default=None, help='Tags list')
+    parser.add_argument('--wandb-mode', type=str, default=None, choices=['online', 'offline', 'disabled'], help='W&B mode')
+    parser.add_argument('--wandb-id', type=str, default=None, help='Run ID to resume')
+    parser.add_argument('--wandb-watch', action='store_true', help='Watch model gradients/params')
 
     return parser
