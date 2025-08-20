@@ -1,6 +1,0 @@
-name: unisign
-channels:
-  - defaults
-dependencies:
-  - python=3.9
-prefix: /home/ubuntu/miniconda3/envs/unisign
