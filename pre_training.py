@@ -1,7 +1,6 @@
 # pre_training.py
 import os
 import sys
-import math
 import time
 import json
 import datetime
@@ -20,41 +19,61 @@ from SLRT_metrics import translation_performance
 from config import *  # train_label_paths, dev_label_paths
 
 
+def save_on_master_safe(state, path):
+    """
+    Wrapper to avoid AttributeError if utils.save_on_master does not exist.
+    """
+    try:
+        if hasattr(utils, "save_on_master"):
+            utils.save_on_master(state, path)
+        else:
+            if utils.is_main_process():
+                torch.save(state, path)
+    except Exception as e:
+        print(f"[warn] save_on_master fallback error for {path}: {e}")
+
+
+def build_loader_news(args, phase: str, aug_progress: float = 0.0):
+    """
+    Build CSL_News dataset + loader. For train, pass aug_progress in [0,1].
+    """
+    if phase == 'train':
+        dataset = S2T_Dataset_news(path=train_label_paths[args.dataset], args=args, phase='train')
+        # Set augmentation progress (will be used in __getitem__)
+        dataset.set_augmentation_progress(aug_progress)
+        sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True)
+    else:
+        dataset = S2T_Dataset_news(path=dev_label_paths[args.dataset], args=args, phase='dev')
+        sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=False)
+
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        collate_fn=dataset.collate_fn,
+        sampler=sampler,
+        pin_memory=args.pin_mem,
+        drop_last=(phase == 'train'),
+        persistent_workers=(args.persistent_workers and args.num_workers > 0),
+        prefetch_factor=(args.prefetch_factor if args.num_workers > 0 else None),
+    )
+    return dataset, sampler, loader
+
+
 def main(args):
     utils.init_distributed_mode_ds(args)
 
     print(args)
     utils.set_seed(args.seed)
 
-    print("Creating dataset:")
-    train_data = S2T_Dataset_news(path=train_label_paths[args.dataset], args=args, phase='train')
-    print(train_data)
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_data, shuffle=True)
-    train_dataloader = DataLoader(
-        train_data,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        collate_fn=train_data.collate_fn,
-        sampler=train_sampler,
-        pin_memory=args.pin_mem,
-        drop_last=True,
-        persistent_workers=(args.persistent_workers and args.num_workers > 0),
-        prefetch_factor=(args.prefetch_factor if args.num_workers > 0 else None),
-    )
-
-    dev_data = S2T_Dataset_news(path=dev_label_paths[args.dataset], args=args, phase='dev')
+    # Build dev (fixed) and a temp train loader (for scheduler sizing)
+    print("Creating dev dataset/loader:")
+    dev_data, dev_sampler, dev_dataloader = build_loader_news(args, phase='dev', aug_progress=0.0)
     print(dev_data)
-    dev_sampler = torch.utils.data.distributed.DistributedSampler(dev_data, shuffle=False)
-    dev_dataloader = DataLoader(
-        dev_data,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        collate_fn=dev_data.collate_fn,
-        sampler=dev_sampler,
-        pin_memory=args.pin_mem,
-        persistent_workers=(args.persistent_workers and args.num_workers > 0),
-        prefetch_factor=(args.prefetch_factor if args.num_workers > 0 else None),
-    )
+
+    print("Creating temp train dataset/loader (for schedule sizing):")
+    tmp_train_data, tmp_train_sampler, tmp_train_dataloader = build_loader_news(args, phase='train', aug_progress=0.0)
+    print(tmp_train_data)
 
     print("Creating model:")
     model = Uni_Sign(args=args).cuda().train()
@@ -76,15 +95,16 @@ def main(args):
     optimizer = create_optimizer(args, model_without_ddp)
 
     if args.quick_break <= 0:
-        args.quick_break = len(train_dataloader)
+        args.quick_break = len(tmp_train_dataloader)
 
     lr_scheduler = get_scheduler(
         name='cosine',
         optimizer=optimizer,
-        num_warmup_steps=int(args.warmup_epochs * len(train_dataloader) / args.gradient_accumulation_steps),
-        num_training_steps=int(args.epochs * len(train_dataloader) / args.gradient_accumulation_steps),
+        num_warmup_steps=int(args.warmup_epochs * len(tmp_train_dataloader) / args.gradient_accumulation_steps),
+        num_training_steps=int(args.epochs * len(tmp_train_dataloader) / args.gradient_accumulation_steps),
     )
 
+    # DeepSpeed init
     model, optimizer, lr_scheduler = utils.init_deepspeed(args, model, optimizer, lr_scheduler)
     model_without_ddp = model.module  # DeepSpeed engine -> underlying module
 
@@ -106,11 +126,15 @@ def main(args):
         "persistent_workers": args.persistent_workers,
         "rgb_support": args.rgb_support,
     }
+    # Your utils.init_wandb should accept (args, config=...) per your current codebase
     wandb_run = utils.init_wandb(args, config=config)
     if getattr(args, "wandb_watch", False):
         utils.wandb_watch(wandb_run, model_without_ddp, log="gradients", log_freq=max(1, args.print_freq))
 
-    output_dir = Path(args.output_dir)
+    output_dir = Path(args.output_dir) if args.output_dir else None
+    if output_dir:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
     start_time = time.time()
     max_bleu4 = 0.0
     global_step = 0  # count dataloader iterations
@@ -121,8 +145,17 @@ def main(args):
             _ = evaluate(args, dev_dataloader, model, model_without_ddp, wandb_run, global_step)
         return
 
+    # Schedule: ramp augmentation over first ~30% epochs
+    aug_ramp_epochs = max(1, int(0.3 * args.epochs))
+
     print(f"Start training for {args.epochs} epochs")
     for epoch in range(0, args.epochs):
+        # progress in [0,1]
+        progress = min(1.0, epoch / float(aug_ramp_epochs))
+        print(f"[Epoch {epoch}] augmentation progress = {progress:.3f}")
+
+        # Rebuild train dataset/loader so worker processes pick up updated progress
+        train_data, train_sampler, train_dataloader = build_loader_news(args, phase='train', aug_progress=progress)
         if args.distributed:
             train_sampler.set_epoch(epoch)
 
@@ -133,11 +166,13 @@ def main(args):
             step_offset=global_step
         )
 
-        if args.output_dir:
+        # Save epoch checkpoint
+        if output_dir:
             checkpoint_paths = [output_dir / f'checkpoint_{epoch}.pth']
             for checkpoint_path in checkpoint_paths:
-                utils.save_on_master({'model': get_requires_grad_dict(model_without_ddp)}, checkpoint_path)
+                save_on_master_safe({'model': get_requires_grad_dict(model_without_ddp)}, checkpoint_path)
 
+        # Evaluate on fixed dev
         test_stats = evaluate(args, dev_dataloader, model, model_without_ddp, wandb_run, global_step)
         print(f"BLEU-4 of the network on the {len(dev_dataloader)} dev videos: {test_stats['bleu4']:.2f}")
 
@@ -154,20 +189,20 @@ def main(args):
             "max_mem_MB": torch.cuda.max_memory_allocated() / (1024**2) if torch.cuda.is_available() else 0.0,
         }, step=global_step)
 
+        # Track best BLEU-4
         if max_bleu4 < test_stats["bleu4"]:
             max_bleu4 = test_stats["bleu4"]
-            if args.output_dir and utils.is_main_process():
+            if output_dir and utils.is_main_process():
                 checkpoint_paths = [output_dir / 'best_checkpoint.pth']
                 for checkpoint_path in checkpoint_paths:
-                    utils.save_on_master({'model': get_requires_grad_dict(model_without_ddp)}, checkpoint_path)
+                    save_on_master_safe({'model': get_requires_grad_dict(model_without_ddp)}, checkpoint_path)
 
         print(f'Max BLEU-4: {max_bleu4:.2f}%')
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      **{f'test_{k}': v for k, v in test_stats.items()},
-                     'epoch': epoch,
-                     'n_parameters': n_parameters}
+                     'epoch': epoch}
 
-        if args.output_dir and utils.is_main_process():
+        if output_dir and utils.is_main_process():
             with (output_dir / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
@@ -206,7 +241,7 @@ def train_one_epoch(args, model, data_loader, optimizer, epoch, model_without_dd
             output_dir = Path(args.output_dir)
             checkpoint_paths = [output_dir / f'checkpoint.pth']
             for checkpoint_path in checkpoint_paths:
-                utils.save_on_master({'model': get_requires_grad_dict(model_without_ddp)}, checkpoint_path)
+                save_on_master_safe({'model': get_requires_grad_dict(model_without_ddp)}, checkpoint_path)
 
         # Move to device; only cast float tensors
         for k, v in list(src_input.items()):
@@ -306,7 +341,6 @@ def evaluate(args, data_loader, model, model_without_ddp, wandb_run=None, step_f
     # Optionally: log a few predictions (rank-0)
     if wandb_run is not None and utils.is_main_process():
         try:
-            import pandas as pd
             import wandb
             k = min(8, len(preds))
             table = wandb.Table(data=[[refs[i], preds[i]] for i in range(k)], columns=["ref", "pred"])
