@@ -52,6 +52,8 @@ export TORCH_CPP_LOG_LEVEL=ERROR
 export DEEPSPEED_LOG_LEVEL=ERROR
 export NCCL_DEBUG=ERROR
 export NCCL_IB_DISABLE=1  # if you don't have IB
+export TF_CPP_MIN_LOG_LEVEL=3       # hide INFO+WARN from TensorFlow
+export TF_ENABLE_ONEDNN_OPTS=1 
 
 # Optional but helpful on Ampere+:
 python - <<'PY' || true

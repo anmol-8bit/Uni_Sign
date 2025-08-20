@@ -30,6 +30,7 @@ import torch.backends.cudnn as cudnn
 import deepspeed
 from deepspeed.accelerator import get_accelerator
 import torch.distributed as tdist
+from typing import Optional, Dict, Any
 
 
 # -----------------------------
@@ -52,54 +53,64 @@ def is_main_process():
 # -----------------------------
 # W&B helpers (safe no-op when disabled)
 # -----------------------------
-
-def init_wandb(args, config):
+def init_wandb(args, config: Optional[Dict[str, Any]] = None):
     """
-    Initialize Weights & Biases on rank-0 only.
-    Returns a wandb run object or None.
+    Create a wandb run on rank-0 only. Returns run or None.
     """
-    if not getattr(args, "wandb", False):
+    if not getattr(args, "wandb", False) or not is_main_process():
         return None
-    mode = getattr(args, "wandb_mode", None)
-    if mode == "disabled":
-        return None
-
-    if not is_main_process():
-        # ensure non-main ranks don't try to start a run
-        os.environ["WANDB_MODE"] = "disabled"
-
     try:
         import wandb
-    except Exception:
-        if is_main_process():
-            print("[W&B] wandb not installed; skipping.")
+        # Safe default if args.wandb_mode is missing/None
+        mode = getattr(args, "wandb_mode", None) or os.environ.get("WANDB_MODE", "online")
+
+        base_config = {
+            "batch_size": args.batch_size,
+            "grad_accum": args.gradient_accumulation_steps,
+            "epochs": args.epochs,
+            "lr": args.lr,
+            "warmup_epochs": args.warmup_epochs,
+            "dataset": args.dataset,
+            "dtype": args.dtype,
+            "zero_stage": args.zero_stage,
+            "max_length": args.max_length,
+            "world_size": get_world_size(),
+        }
+        if isinstance(config, dict):
+            base_config.update(config)
+
+        run = wandb.init(
+            project=getattr(args, "wandb_project", "unisign"),
+            entity=getattr(args, "wandb_entity", None),
+            name=getattr(args, "wandb_run_name", None),
+            group=getattr(args, "wandb_group", None),
+            tags=getattr(args, "wandb_tags", None),
+            id=getattr(args, "wandb_id", None),
+            resume="allow" if getattr(args, "wandb_id", None) else None,
+            mode=mode,
+            config=base_config,
+        )
+        return run
+    except Exception as e:
+        print(f"[wandb] init disabled or failed: {e}")
         return None
 
-    # honor explicit mode if given
-    if mode in ("online", "offline"):
-        os.environ["WANDB_MODE"] = mode
-
-    run = wandb.init(
-        project=getattr(args, "wandb_project", "unisign"),
-        entity=getattr(args, "wandb_entity", None),
-        name=getattr(args, "wandb_run_name", None),
-        group=getattr(args, "wandb_group", None),
-        tags=getattr(args, "wandb_tags", None),
-        id=getattr(args, "wandb_id", None),
-        resume="allow" if getattr(args, "wandb_id", None) else None,
-        config=config,
-        reinit=False,
-        settings=wandb.Settings(start_method="thread"),
-    )
-    return run
-
-def wandb_log(run, metrics: dict, step: int | None = None, commit: bool = True):
+def wandb_log(run, metrics: Dict[str, Any], step: Optional[int] = None, commit: bool = True):
+    """Safe logging; no-ops if run is None."""
     if run is None:
         return
-    if not is_main_process():
-        return
     try:
-        run.log(metrics, step=step, commit=commit)
+        if step is not None:
+            run.log(metrics, step=step, commit=commit)
+        else:
+            run.log(metrics, commit=commit)
+    except Exception as e:
+        print(f"[wandb] log failed: {e}")
+
+def wandb_close(run):
+    try:
+        if run is not None:
+            run.finish()
     except Exception:
         pass
 
