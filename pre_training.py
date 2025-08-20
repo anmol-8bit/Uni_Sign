@@ -1,3 +1,4 @@
+# pre_training.py
 import os
 import sys
 import math
@@ -5,11 +6,9 @@ import time
 import json
 import datetime
 from pathlib import Path
-from typing import Iterable, Optional
 
 import torch
 from torch.utils.data import DataLoader
-from torch.nn.utils.rnn import pad_sequence  # (kept if you need elsewhere)
 
 from timm.optim import create_optimizer
 from transformers import get_scheduler
@@ -89,14 +88,37 @@ def main(args):
     model, optimizer, lr_scheduler = utils.init_deepspeed(args, model, optimizer, lr_scheduler)
     model_without_ddp = model.module  # DeepSpeed engine -> underlying module
 
+    # ---- W&B init (rank-0 only) ----
+    world_size = utils.get_world_size()
+    config = {
+        "epochs": args.epochs,
+        "lr": args.lr,
+        "batch_size_per_gpu": args.batch_size,
+        "grad_accum": args.gradient_accumulation_steps,
+        "world_size": world_size,
+        "zero_stage": args.zero_stage,
+        "dtype": args.dtype,
+        "dataset": args.dataset,
+        "max_length": args.max_length,
+        "print_freq": args.print_freq,
+        "num_workers": args.num_workers,
+        "prefetch_factor": getattr(args, "prefetch_factor", None),
+        "persistent_workers": args.persistent_workers,
+        "rgb_support": args.rgb_support,
+    }
+    wandb_run = utils.init_wandb(args, config=config)
+    if getattr(args, "wandb_watch", False):
+        utils.wandb_watch(wandb_run, model_without_ddp, log="gradients", log_freq=max(1, args.print_freq))
+
     output_dir = Path(args.output_dir)
     start_time = time.time()
-    max_accuracy = 0
+    max_bleu4 = 0.0
+    global_step = 0  # count dataloader iterations
 
     if args.eval:
         if utils.is_main_process():
             print("📄 test result")
-            _ = evaluate(args, dev_dataloader, model, model_without_ddp)
+            _ = evaluate(args, dev_dataloader, model, model_without_ddp, wandb_run, global_step)
         return
 
     print(f"Start training for {args.epochs} epochs")
@@ -104,24 +126,42 @@ def main(args):
         if args.distributed:
             train_sampler.set_epoch(epoch)
 
-        train_stats = train_one_epoch(args, model, train_dataloader, optimizer, epoch, model_without_ddp=model_without_ddp)
+        train_stats, global_step = train_one_epoch(
+            args, model, train_dataloader, optimizer, epoch,
+            model_without_ddp=model_without_ddp,
+            wandb_run=wandb_run,
+            step_offset=global_step
+        )
 
         if args.output_dir:
             checkpoint_paths = [output_dir / f'checkpoint_{epoch}.pth']
             for checkpoint_path in checkpoint_paths:
                 utils.save_on_master({'model': get_requires_grad_dict(model_without_ddp)}, checkpoint_path)
 
-        test_stats = evaluate(args, dev_dataloader, model, model_without_ddp)
+        test_stats = evaluate(args, dev_dataloader, model, model_without_ddp, wandb_run, global_step)
         print(f"BLEU-4 of the network on the {len(dev_dataloader)} dev videos: {test_stats['bleu4']:.2f}")
 
-        if max_accuracy < test_stats["bleu4"]:
-            max_accuracy = test_stats["bleu4"]
+        # log per-epoch to W&B
+        utils.wandb_log(wandb_run, {
+            "epoch": epoch,
+            "train/loss": train_stats.get("loss", float('nan')),
+            "val/loss": test_stats.get("loss", float('nan')),
+            "val/bleu1": test_stats.get("bleu1", float('nan')),
+            "val/bleu2": test_stats.get("bleu2", float('nan')),
+            "val/bleu3": test_stats.get("bleu3", float('nan')),
+            "val/bleu4": test_stats.get("bleu4", float('nan')),
+            "val/rouge": test_stats.get("rouge", float('nan')),
+            "max_mem_MB": torch.cuda.max_memory_allocated() / (1024**2) if torch.cuda.is_available() else 0.0,
+        }, step=global_step)
+
+        if max_bleu4 < test_stats["bleu4"]:
+            max_bleu4 = test_stats["bleu4"]
             if args.output_dir and utils.is_main_process():
                 checkpoint_paths = [output_dir / 'best_checkpoint.pth']
                 for checkpoint_path in checkpoint_paths:
                     utils.save_on_master({'model': get_requires_grad_dict(model_without_ddp)}, checkpoint_path)
 
-        print(f'Max BLEU-4: {max_accuracy:.2f}%')
+        print(f'Max BLEU-4: {max_bleu4:.2f}%')
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      **{f'test_{k}': v for k, v in test_stats.items()},
                      'epoch': epoch,
@@ -135,8 +175,15 @@ def main(args):
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
 
+    # finish W&B
+    if wandb_run is not None and utils.is_main_process():
+        try:
+            wandb_run.finish()
+        except Exception:
+            pass
 
-def train_one_epoch(args, model, data_loader, optimizer, epoch, model_without_ddp):
+
+def train_one_epoch(args, model, data_loader, optimizer, epoch, model_without_ddp, wandb_run=None, step_offset=0):
     model.train()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -152,9 +199,10 @@ def train_one_epoch(args, model, data_loader, optimizer, epoch, model_without_dd
 
     running_loss = torch.zeros((), device=device)
     running_count = 0
+    step = step_offset
 
-    for step, (src_input, tgt_input) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-        if (step + 1) % args.quick_break == 0 and args.output_dir:
+    for iter_idx, (src_input, tgt_input) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        if (iter_idx + 1) % args.quick_break == 0 and args.output_dir:
             output_dir = Path(args.output_dir)
             checkpoint_paths = [output_dir / f'checkpoint.pth']
             for checkpoint_path in checkpoint_paths:
@@ -180,19 +228,26 @@ def train_one_epoch(args, model, data_loader, optimizer, epoch, model_without_dd
 
         running_loss += total_loss.detach()
         running_count += 1
+        step += 1
 
-        if (step + 1) % print_freq == 0 or (step + 1) == len(data_loader):
+        # periodic log (averaged since last print)
+        if (iter_idx + 1) % print_freq == 0 or (iter_idx + 1) == len(data_loader):
             loss_val = (running_loss / max(1, running_count)).float().item()
-            metric_logger.update(loss=loss_val, lr=optimizer.param_groups[0]["lr"])
+            current_lr = optimizer.param_groups[0]["lr"]
+            metric_logger.update(loss=loss_val, lr=current_lr)
+            utils.wandb_log(wandb_run, {
+                "train/loss": loss_val,
+                "train/lr": current_lr,
+            }, step=step)
             running_loss.zero_()
             running_count = 0
 
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    return ({k: meter.global_avg for k, meter in metric_logger.meters.items()}, step)
 
 
-def evaluate(args, data_loader, model, model_without_ddp):
+def evaluate(args, data_loader, model, model_without_ddp, wandb_run=None, step_for_log: int = 0):
     model.eval()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -207,7 +262,7 @@ def evaluate(args, data_loader, model, model_without_ddp):
         preds = []
         refs = []
 
-        for step, (src_input, tgt_input) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        for _, (src_input, tgt_input) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
             for k, v in list(src_input.items()):
                 if isinstance(v, torch.Tensor):
                     v = v.to(device, non_blocking=True)
@@ -238,13 +293,26 @@ def evaluate(args, data_loader, model, model_without_ddp):
     print('* BLEU-4 {top1.global_avg:.3f} loss {losses.global_avg:.3f}'.format(
         top1=metric_logger.bleu4, losses=metric_logger.loss))
 
-    if utils.is_main_process() and utils.get_world_size() == 1 and args.eval and args.output_dir:
-        with open(os.path.join(args.output_dir, 'tmp_pres.txt'), 'w') as f:
-            for s in preds:
-                f.write(s + '\n')
-        with open(os.path.join(args.output_dir, 'tmp_refs.txt'), 'w') as f:
-            for s in refs:
-                f.write(s + '\n')
+    # log validation summary to W&B
+    utils.wandb_log(wandb_run, {
+        "val/loss": metric_logger.loss.global_avg,
+        "val/bleu1": metric_logger.bleu1.global_avg if 'bleu1' in metric_logger.meters else float('nan'),
+        "val/bleu2": metric_logger.bleu2.global_avg if 'bleu2' in metric_logger.meters else float('nan'),
+        "val/bleu3": metric_logger.bleu3.global_avg if 'bleu3' in metric_logger.meters else float('nan'),
+        "val/bleu4": metric_logger.bleu4.global_avg if 'bleu4' in metric_logger.meters else float('nan'),
+        "val/rouge": metric_logger.rouge.global_avg if 'rouge' in metric_logger.meters else float('nan'),
+    }, step=step_for_log)
+
+    # Optionally: log a few predictions (rank-0)
+    if wandb_run is not None and utils.is_main_process():
+        try:
+            import pandas as pd
+            import wandb
+            k = min(8, len(preds))
+            table = wandb.Table(data=[[refs[i], preds[i]] for i in range(k)], columns=["ref", "pred"])
+            wandb_run.log({"samples": table}, step=step_for_log)
+        except Exception:
+            pass
 
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
