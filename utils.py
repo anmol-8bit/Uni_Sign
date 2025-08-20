@@ -277,6 +277,16 @@ class MetricLogger(object):
 # Misc helpers
 # -----------------------------
 
+def save_on_master(*args, **kwargs):
+    """
+    Torch save that only runs on rank-0 (main) to avoid multi-rank write clashes.
+    Usage: save_on_master({'model': state_dict}, path)
+    """
+    if is_main_process():
+        print("save ckpt begin")
+        torch.save(*args, **kwargs)
+        print("save ckpt finish")
+
 def count_parameters_in_MB(model):
     return np.sum(np.prod(v.size()) for _, v in model.named_parameters()) / 1e6
 
