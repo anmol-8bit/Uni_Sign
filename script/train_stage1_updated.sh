@@ -12,7 +12,7 @@ OUT_DIR="out/stage1_pretraining"
 DATASET="CSL_News"
 
 # Effective batch = micro_batch_per_gpu * grad_accum * world_size
-MICRO_BSZ=64
+MICRO_BSZ=48
 GRAD_ACCUM=1
 EPOCHS=30
 LR=3e-4
@@ -30,7 +30,7 @@ QUICK_BREAK=2048              # periodic checkpoint trigger
 USE_WANDB=1                   # set 0 to disable
 WANDB_PROJECT="unisign"
 WANDB_ENTITY=""               # set if you use a team/org
-WANDB_RUN_NAME="stage1-pretrain-augmentations"
+WANDB_RUN_NAME="stage1-pretrain-augmentations_arch1"
 WANDB_GROUP="stage1"
 WANDB_TAGS="pretrain deepspeed bf16"
 WANDB_MODE="online"           # online|offline|disabled
@@ -39,7 +39,7 @@ WANDB_ID=""                   # set to resume a specific run id
 
 mkdir -p "${OUT_DIR}"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-LOGFILE="${OUT_DIR}/train_${TIMESTAMP}_augmentations.log"
+LOGFILE="${OUT_DIR}/train_${TIMESTAMP}_augmentations_arch_1.log"
 
 # Reasonable defaults for a single host, 8x GPUs
 export TOKENIZERS_PARALLELISM=false
