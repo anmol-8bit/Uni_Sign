@@ -1,62 +1,69 @@
-# models.py  -- Steps 1..3 applied
+# models.py  — Tier A: (1) attention pooling over joints, (2) joint embeddings + graph bias,
+#                (3) velocity/acceleration channels to the pose MLP, (4) pose-EMA scaffolding.
 from torch import Tensor
 import torch
 from torch import nn
+import torch.nn.functional as F
 import torch.utils.checkpoint
 import contextlib
 import torchvision
 from einops import rearrange
-
 import math
+import warnings
+
 from stgcn_layers import Graph, get_stgcn_chain
 from deformable_attention_2d import DeformableAttention2D
 from transformers import MT5ForConditionalGeneration, T5Tokenizer
-import warnings
 from config import mt5_path
+
 
 # -------------------------
 # init helpers
 # -------------------------
 def _no_grad_trunc_normal_(tensor, mean, std, a, b):
-    def norm_cdf(x):
-        return (1. + math.erf(x / math.sqrt(2.))) / 2.
+    def norm_cdf(x): return (1. + math.erf(x / math.sqrt(2.))) / 2.
     if (mean < a - 2 * std) or (mean > b + 2 * std):
-        warnings.warn("mean is >2 std from [a, b] in trunc_normal_.", stacklevel=2)
+        warnings.warn("mean is > 2 std from [a, b] in trunc_normal_.", stacklevel=2)
     with torch.no_grad():
-        l = norm_cdf((a - mean) / std)
-        u = norm_cdf((b - mean) / std)
-        tensor.uniform_(2 * l - 1, 2 * u - 1)
-        tensor.erfinv_()
-        tensor.mul_(std * math.sqrt(2.))
-        tensor.add_(mean)
-        tensor.clamp_(min=a, max=b)
+        l = norm_cdf((a - mean) / std); u = norm_cdf((b - mean) / std)
+        tensor.uniform_(2 * l - 1, 2 * u - 1).erfinv_()
+        tensor.mul_(std * math.sqrt(2.)).add_(mean).clamp_(min=a, max=b)
         return tensor
 
 def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
     return _no_grad_trunc_normal_(tensor, mean, std, a, b)
 
+
 # -------------------------
 # main model
 # -------------------------
 class Uni_Sign(nn.Module):
+    """
+    Tier A upgrades inside this class:
+      - ATTENTION POOLING over joints with a learned [CLS] per part (replaces mean over joints).
+      - JOINT EMBEDDINGS + learned GRAPH (hop) BIAS injected into the attention scores.
+      - VELOCITY/ACCELERATION channels added to pose features -> 3 -> 7 dims before ST-GCN.
+      - (Optional) EMA scaffolding for the pose encoder: call from training loop if desired.
+    """
     def __init__(self, args):
-        super(Uni_Sign, self).__init__()
+        super().__init__()
         self.args = args
 
-        # parts and dims
+        # ---------------- model sizes ----------------
         self.modes = ['body', 'left', 'right', 'face_all']
-        self.per_part_dim = 256               # ST-GCN final dim from your chain
-        self.concat_dim = self.per_part_dim * len(self.modes)
+        self.per_part_dim = 256                # ST-GCN output per part
+        self.concat_dim   = self.per_part_dim * len(self.modes)  # 256 * 4 = 1024
+
+        # Velocity/acceleration: (x,y,score, dx,dy, ddx,ddy) = 7
+        self.pose_in_dim = 7                   # <<< was 3
 
         # ---------- Graph + per-part ST-GCN encoders ----------
         self.graph, A = {}, []
-        self.proj_linear = nn.ModuleDict()
-        hidden_dim_for_rgb = args.hidden_dim  # used by RGB fusion blocks
+        self.proj_linear = nn.ModuleDict()     # 7 -> 64 per part
         for mode in self.modes:
             self.graph[mode] = Graph(layout=f'{mode}', strategy='distance', max_hop=1)
             A.append(torch.tensor(self.graph[mode].A, dtype=torch.float32, requires_grad=False))
-            # (x, y, score) -> 64
-            self.proj_linear[mode] = nn.Linear(3, 64)
+            self.proj_linear[mode] = nn.Linear(self.pose_in_dim, 64)
 
         self.gcn_modules = nn.ModuleDict()
         self.fusion_gcn_modules = nn.ModuleDict()
@@ -68,15 +75,42 @@ class Uni_Sign(nn.Module):
             self.fusion_gcn_modules[mode], _ = get_stgcn_chain(
                 self.per_part_dim, 'temporal', (5, spatial_kernel_size), A[index].clone(), True
             )
+        # NOTE: we keep left/right UN-TIED (Step 1 from your previous upgrade).
 
-        # NOTE (Step 1): DO NOT tie left/right weights. We intentionally
-        # remove lines like:
-        #   self.gcn_modules['left'] = self.gcn_modules['right']
-        #   self.fusion_gcn_modules['left'] = self.fusion_gcn_modules['right']
-        #   self.proj_linear['left'] = self.proj_linear['right']
+        # ---------- (Tier A-1) Attention pooling over joints ----------
+        # We replace mean(-1) pooling with: [CLS] + MHSA over (V joints), per time frame, per part.
+        # Also add: joint-type embeddings and learned graph-bias into attention scores.
+        self.joint_embed     = nn.ModuleDict()     # per-part joint embeddings (V, C)
+        self.cls_token       = nn.ParameterDict()  # per-part [CLS] (1,1,C)
+        self.joint_pool_attn = nn.ModuleDict()     # per-part MultiheadAttention over joints
+        self.graph_bias_table= nn.ModuleDict()     # per-part embedding: hop-bucket -> scalar bias
+        # store (V,V) hop-bucket ids as buffers for fast lookup
+        for mode in self.modes:
+            V = self._num_joints(mode)
+            self.joint_embed[mode] = nn.Embedding(V, self.per_part_dim)
+            trunc_normal_(self.joint_embed[mode].weight, std=0.02)
 
-        # ---------- Step 2: Per-part temporal Transformer (over time) ----------
-        # small 2-layer encoder; shared hyperparams across parts
+            cls = nn.Parameter(torch.zeros(1, 1, self.per_part_dim))
+            trunc_normal_(cls, std=0.02)
+            self.cls_token[mode] = cls
+
+            self.joint_pool_attn[mode] = nn.MultiheadAttention(
+                embed_dim=self.per_part_dim, num_heads=8, batch_first=True
+            )
+
+            # hop distance buckets: {0,1,2}, where 2 = far/unconnected (inf)
+            hop = self.graph[mode].hop_dis.copy()  # numpy array
+            hop = hop.astype('float32')
+            hop[~(hop == hop)] = float('inf')      # clean NaNs if any
+            hop_bucket = (hop > 1).astype('int64') * 2 + (hop == 1).astype('int64')  # 0/1/2
+            hop_bucket = torch.from_numpy(hop_bucket).long()
+            self.register_buffer(f"{mode}_graph_buckets", hop_bucket, persistent=False)
+
+            # learned scalar bias per bucket (shared across heads for simplicity/stability)
+            self.graph_bias_table[mode] = nn.Embedding(3, 1)  # 0,1,2 -> scalar
+            nn.init.zeros_(self.graph_bias_table[mode].weight)  # start neutral
+
+        # ---------- Per-part temporal Transformer over time (already in your Step 2) ----------
         def make_temporal_tx():
             layer = nn.TransformerEncoderLayer(
                 d_model=self.per_part_dim, nhead=8, dim_feedforward=1024,
@@ -84,36 +118,28 @@ class Uni_Sign(nn.Module):
             )
             return nn.TransformerEncoder(layer, num_layers=2)
         self.temporal_tx = nn.ModuleDict({m: make_temporal_tx() for m in self.modes})
-        # learned 1D pos embedding along time (shared across parts)
         self.temporal_pos = nn.Parameter(torch.zeros(args.max_length, self.per_part_dim))
         trunc_normal_(self.temporal_pos, std=0.02)
 
-        # ---------- Step 3: Cross-part transformer (4 tokens per time step) ----------
-        # learnable part embeddings (body/left/right/face)
+        # ---------- Cross-part transformer (already in your Step 3) ----------
         self.part_embed = nn.Embedding(len(self.modes), self.per_part_dim)
         trunc_normal_(self.part_embed.weight, std=0.02)
-
         cross_layer = nn.TransformerEncoderLayer(
             d_model=self.per_part_dim, nhead=4, dim_feedforward=512,
             dropout=0.1, batch_first=True, norm_first=True
         )
         self.cross_part_tx = nn.TransformerEncoder(cross_layer, num_layers=1)
 
-        # a small bias after concat (kept for compatibility with your code)
-        self.part_para = nn.Parameter(torch.zeros(self.concat_dim))
-
-        # project pose tokens into MT5 hidden size (=768 in your setup)
-        self.pose_proj = nn.Linear(self.concat_dim, 768)
+        self.part_para = nn.Parameter(torch.zeros(self.concat_dim))  # kept for compatibility
+        self.pose_proj = nn.Linear(self.concat_dim, 768)             # into MT5 hidden size
 
         # ---------- Language selection ----------
-        if "CSL" in self.args.dataset:
-            self.lang = 'Chinese'
-        else:
-            self.lang = 'English'
+        self.lang = 'Chinese' if "CSL" in self.args.dataset else 'English'
 
         # ---------- Optional RGB support path (unchanged) ----------
         self.rgb_support = getattr(self.args, "rgb_support", False)
         if self.rgb_support:
+            hidden_dim_for_rgb = args.hidden_dim
             self.rgb_support_backbone = torch.nn.Sequential(
                 *list(torchvision.models.efficientnet_b0(pretrained=True).children())[:-2]
             )
@@ -139,8 +165,18 @@ class Uni_Sign(nn.Module):
         self.mt5_model = MT5ForConditionalGeneration.from_pretrained(mt5_path)
         self.mt5_tokenizer = T5Tokenizer.from_pretrained(mt5_path, legacy=False)
 
-        # init linears / norms
+        # ---------- init linears / norms ----------
         self.apply(self._init_weights)
+
+        # ---------- (Tier A-4) EMA scaffolding (optional) ----------
+        self._ema_state = None
+        self._ema_decay = None
+        self._ema_backup_state = None
+
+    # ---------- utilities ----------
+    def _num_joints(self, part: str) -> int:
+        # use underlying graph object
+        return self.graph[part].A.shape[-1]
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -154,7 +190,27 @@ class Uni_Sign(nn.Module):
     def maybe_autocast(self, dtype=torch.float32):
         return torch.cuda.amp.autocast(dtype=dtype) if True else contextlib.nullcontext()
 
-    # ---------------- RGB fusion (unchanged) ----------------
+    # ---------- velocity/acceleration feature builder ----------
+    @staticmethod
+    def _with_deltas(xyz: torch.Tensor) -> torch.Tensor:
+        """
+        xyz: (B, T, V, 3) with channels [x, y, score]
+        returns (B, T, V, 7): [x, y, score, dx, dy, ddx, ddy]
+        """
+        pos = xyz[..., :2]             # (B,T,V,2)
+        score = xyz[..., 2:3]          # (B,T,V,1)
+
+        # first-order velocity
+        d1 = pos[:, 1:] - pos[:, :-1]  # (B,T-1,V,2)
+        d1 = F.pad(d1, (0, 0, 0, 0, 1, 0))  # pad time at front -> (B,T,V,2)
+
+        # second-order acceleration
+        d2 = d1[:, 1:] - d1[:, :-1]    # (B,T-1,V,2)
+        d2 = F.pad(d2, (0, 0, 0, 0, 2, 0))  # two zeros at front -> (B,T,V,2)
+
+        return torch.cat([pos, score, d1, d2], dim=-1)  # (B,T,V,7)
+
+    # ---------- RGB fusion (unchanged) ----------
     def gather_feat_pose_rgb(self, gcn_feat, rgb_feat, indices, rgb_len, pose_init):
         b, c, T, n = gcn_feat.shape
         assert rgb_feat.shape[0] == indices.shape[0]
@@ -193,9 +249,41 @@ class Uni_Sign(nn.Module):
         assert start == rgb_feat.shape[0]
         return gcn_feat
 
+    # ---------- (Tier A-1/2) attention pooling over joints ----------
+    def _attention_pool_joints(self, part: str, gcn_feat: torch.Tensor) -> torch.Tensor:
+        """
+        gcn_feat: (B, C, T, V)  -> returns pooled tokens: (B, T, C)
+        Mechanism: [CLS] + self-attention over joints with joint embeddings and graph-bias.
+        """
+        B, C, T, V = gcn_feat.shape
+        x = gcn_feat.permute(0, 2, 3, 1).contiguous()   # (B,T,V,C)
+        x = x.view(B * T, V, C)                         # (B*T, V, C)
+
+        # add joint-type embeddings (broadcast over batch*time)
+        joint_ids = torch.arange(V, device=x.device)
+        joint_emb = self.joint_embed[part](joint_ids)[None, :, :]  # (1,V,C)
+        x = x + joint_emb
+
+        # prepend [CLS]
+        cls = self.cls_token[part].expand(B * T, 1, C)  # (B*T,1,C)
+        seq = torch.cat([cls, x], dim=1)                # (B*T, V+1, C)
+
+        # build learned graph bias (scalar) and place into (L,L) with zeros for CLS row/col
+        hop_ids: torch.Tensor = getattr(self, f"{part}_graph_buckets")  # (V,V)
+        bias = self.graph_bias_table[part](hop_ids).squeeze(-1).to(seq.dtype)  # (V,V)
+        L = V + 1
+        full_bias = torch.zeros(L, L, dtype=seq.dtype, device=seq.device)
+        full_bias[1:, 1:] = bias  # no bias on cls-to-*
+        # NOTE: nn.MultiheadAttention treats attn_mask as additive to attention logits.
+
+        pooled, _ = self.joint_pool_attn[part](seq, seq, seq, attn_mask=full_bias)
+        pooled = pooled[:, 0, :]                           # (B*T, C)
+        pooled = pooled.view(B, T, C)                      # (B, T, C)
+        return pooled
+
     # ---------------- forward ----------------
     def forward(self, src_input, tgt_input):
-        # ---- RGB branch ----
+        # ---- Pose (optionally RGB) ----
         if self.rgb_support:
             rgb_support_dict = {}
             for index_key, rgb_key in zip(['left_sampled_indices', 'right_sampled_indices'],
@@ -204,15 +292,18 @@ class Uni_Sign(nn.Module):
                 rgb_support_dict[index_key] = src_input[index_key]
                 rgb_support_dict[rgb_key] = rgb_feat
 
-        # ---- Pose branch ----
         per_part_tokens = []  # list of (B, T, 256)
-
         body_feat = None
-        for part in self.modes:
-            # (B,T,V,3) -> (B,64,T,V)
-            proj_feat = self.proj_linear[part](src_input[part]).permute(0, 3, 1, 2)
 
-            # spatial GCN
+        for part in self.modes:
+            # ----- NEW: velocity/acceleration channels -----
+            # src_input[part]: (B,T,V,3) -> (B,T,V,7)
+            pose7 = self._with_deltas(src_input[part])
+
+            # 7 -> 64 per joint
+            proj_feat = self.proj_linear[part](pose7).permute(0, 3, 1, 2)  # (B,64,T,V)
+
+            # spatial ST-GCN
             gcn_feat = self.gcn_modules[part](proj_feat)  # (B,256,T,V)
 
             if part == 'body':
@@ -244,13 +335,13 @@ class Uni_Sign(nn.Module):
                 else:
                     raise NotImplementedError
 
-            # temporal GCN
-            gcn_feat = self.fusion_gcn_modules[part](gcn_feat)   # (B,256,T,V)
+            # temporal ST-GCN
+            gcn_feat = self.fusion_gcn_modules[part](gcn_feat)  # (B,256,T,V)
 
-            # pool over joints -> (B,T,256)
-            tokens = gcn_feat.mean(-1).transpose(1, 2)
+            # ----- NEW: attention pooling over joints (replaces mean over V) -----
+            tokens = self._attention_pool_joints(part, gcn_feat)  # (B,T,256)
 
-            # ----- Step 2: per-part temporal transformer over time -----
+            # per-part temporal Transformer over time (kept)
             T = tokens.shape[1]
             pos = self.temporal_pos[:T].unsqueeze(0)             # (1,T,256)
             tokens = tokens + pos
@@ -258,33 +349,25 @@ class Uni_Sign(nn.Module):
 
             per_part_tokens.append(tokens)
 
-        # ----- Step 3: cross-part transformer per time step -----
-        # stack parts -> (B,T,4,256)
-        feats = torch.stack(per_part_tokens, dim=2)
-
-        # add learnable part embeddings
+        # ----- cross-part transformer per time step (kept) -----
+        feats = torch.stack(per_part_tokens, dim=2)              # (B,T,4,256)
         part_ids = torch.arange(len(self.modes), device=feats.device)
         part_emb = self.part_embed(part_ids)[None, None, :, :]   # (1,1,4,256)
         feats = feats + part_emb
 
-        # run tiny transformer across the 4 part tokens for each (B,T)
         B, T, P, C = feats.shape
         feats_bt = feats.reshape(B * T, P, C)                    # (B*T,4,256)
         feats_bt = self.cross_part_tx(feats_bt)                  # (B*T,4,256)
         feats = feats_bt.reshape(B, T, P, C).reshape(B, T, P * C)  # (B,T,1024)
 
-        # optional learned bias (kept from original code)
-        feats = feats + self.part_para
-
-        # project into MT5 hidden size
+        feats = feats + self.part_para                           # optional bias
         inputs_embeds = self.pose_proj(feats)                    # (B,T,768)
 
-        # ---- MT5 prefix + attention mask ----
+        # ---- MT5 prefix + attention mask (kept) ----
         prefix_token = self.mt5_tokenizer(
             [f"Translate sign language video to {self.lang}: "] * len(tgt_input["gt_sentence"]),
             padding="longest", truncation=True, return_tensors="pt",
         ).to(inputs_embeds.device)
-
         prefix_embeds = self.mt5_model.encoder.embed_tokens(prefix_token['input_ids'])
         inputs_embeds = torch.cat([prefix_embeds, inputs_embeds], dim=1)
 
@@ -329,6 +412,55 @@ class Uni_Sign(nn.Module):
             num_beams=num_beams,
         )
         return out
+
+    # ---------------- Pose EMA scaffolding (optional) ----------------
+    def init_pose_ema(self, decay: float = 0.999):
+        """
+        Call once after building the model.
+        Tracks EMA for *pose encoder* params (excludes mt5_model.*).
+        """
+        self._ema_decay = decay
+        self._ema_state = {}
+        for n, p in self.named_parameters():
+            if not p.requires_grad: continue
+            if n.startswith("mt5_model."): continue
+            self._ema_state[n] = p.detach().clone()
+
+    @torch.no_grad()
+    def update_pose_ema(self):
+        """
+        Call after each optimizer step (only if init_pose_ema was called).
+        """
+        if self._ema_state is None: return
+        d = self._ema_decay
+        for n, p in self.named_parameters():
+            if n in self._ema_state:
+                self._ema_state[n].mul_(d).add_(p.detach(), alpha=1.0 - d)
+
+    @torch.no_grad()
+    def swap_to_ema(self):
+        """
+        Swap current pose-encoder params with their EMA copy (use before eval).
+        Call swap_from_ema() to restore training weights.
+        """
+        if self._ema_state is None: return
+        self._ema_backup_state = {}
+        for n, p in self.named_parameters():
+            if n in self._ema_state:
+                self._ema_backup_state[n] = p.detach().clone()
+                p.data.copy_(self._ema_state[n].data)
+
+    @torch.no_grad()
+    def swap_from_ema(self):
+        """
+        Restore pose-encoder params after eval.
+        """
+        if self._ema_backup_state is None: return
+        for n, p in self.named_parameters():
+            if n in self._ema_backup_state:
+                p.data.copy_(self._ema_backup_state[n].data)
+        self._ema_backup_state = None
+
 
 # unchanged
 def get_requires_grad_dict(model):
