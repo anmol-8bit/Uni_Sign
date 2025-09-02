@@ -30,7 +30,7 @@ QUICK_BREAK=2048              # periodic checkpoint trigger
 USE_WANDB=1                   # set 0 to disable
 WANDB_PROJECT="unisign"
 WANDB_ENTITY=""               # set if you use a team/org
-WANDB_RUN_NAME="stage1-pretrain-augmentations_arch1"
+WANDB_RUN_NAME="stage1-pretrain-augmentations_arch2"
 WANDB_GROUP="stage1"
 WANDB_TAGS="pretrain deepspeed bf16"
 WANDB_MODE="online"           # online|offline|disabled
@@ -39,7 +39,7 @@ WANDB_ID=""                   # set to resume a specific run id
 
 mkdir -p "${OUT_DIR}"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-LOGFILE="${OUT_DIR}/train_${TIMESTAMP}_augmentations_arch_1.log"
+LOGFILE="${OUT_DIR}/train_${TIMESTAMP}_augmentations_arch_2.log"
 
 # Reasonable defaults for a single host, 8x GPUs
 export TOKENIZERS_PARALLELISM=false
