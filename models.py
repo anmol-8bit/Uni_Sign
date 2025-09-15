@@ -196,19 +196,33 @@ class Uni_Sign(nn.Module):
         """
         xyz: (B, T, V, 3) with channels [x, y, score]
         returns (B, T, V, 7): [x, y, score, dx, dy, ddx, ddy]
+        Shapes are guaranteed to match along time (no off-by-one).
         """
-        pos = xyz[..., :2]             # (B,T,V,2)
-        score = xyz[..., 2:3]          # (B,T,V,1)
+        # split
+        pos   = xyz[..., :2]   # (B,T,V,2)
+        score = xyz[..., 2:3]  # (B,T,V,1)
 
-        # first-order velocity
-        d1 = pos[:, 1:] - pos[:, :-1]  # (B,T-1,V,2)
-        d1 = F.pad(d1, (0, 0, 0, 0, 1, 0))  # pad time at front -> (B,T,V,2)
+        B, T, V, _ = pos.shape
 
-        # second-order acceleration
-        d2 = d1[:, 1:] - d1[:, :-1]    # (B,T-1,V,2)
-        d2 = F.pad(d2, (0, 0, 0, 0, 2, 0))  # two zeros at front -> (B,T,V,2)
+        # --- first-order velocity (one leading zero) ---
+        if T >= 2:
+            v = pos[:, 1:] - pos[:, :-1]             # (B,T-1,V,2)
+            d1 = torch.cat([torch.zeros_like(pos[:, :1]), v], dim=1)   # (B,T,V,2)
+        else:
+            d1 = torch.zeros_like(pos)               # (B,1,V,2)
 
+        # --- second-order acceleration from pos (true second diff) ---
+        # a[t] = pos[t] - 2*pos[t-1] + pos[t-2], with two leading zeros
+        if T >= 3:
+            a2 = pos[:, 2:] - 2*pos[:, 1:-1] + pos[:, :-2]  # (B,T-2,V,2)
+            d2 = torch.cat([torch.zeros_like(pos[:, :2]), a2], dim=1)  # (B,T,V,2)
+        else:
+            d2 = torch.zeros_like(pos)               # (B,T,V,2) for T=1 or 2
+
+        # all tensors now share (B,T,V,•) — safe to concat on last dim
         return torch.cat([pos, score, d1, d2], dim=-1)  # (B,T,V,7)
+
+
 
     # ---------- RGB fusion (unchanged) ----------
     def gather_feat_pose_rgb(self, gcn_feat, rgb_feat, indices, rgb_len, pose_init):
