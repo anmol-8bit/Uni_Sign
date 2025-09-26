@@ -12,7 +12,7 @@ OUT_DIR="out/stage1_pretraining"
 DATASET="CSL_News"
 
 # Effective batch = micro_batch_per_gpu * grad_accum * world_size
-MICRO_BSZ=48
+MICRO_BSZ=64
 GRAD_ACCUM=1
 EPOCHS=30
 LR=3e-4

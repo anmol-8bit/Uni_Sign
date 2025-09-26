@@ -322,6 +322,7 @@ def init_distributed_mode(args):
         args.distributed = False
         return
     args.distributed = True
+    
     torch.cuda.set_device(args.gpu)
     args.dist_backend = 'nccl'
     print(f'| distributed init (rank {args.rank}): {args.dist_url}', flush=True)
@@ -344,6 +345,8 @@ def init_distributed_mode_ds(args):
         args.distributed = False
         return
     args.distributed = True
+    #torch.cuda.init()
+    deepspeed.init_distributed()
     torch.cuda.set_device(args.gpu)
     args.dist_backend = 'nccl'
     print(f'| distributed init (rank {args.rank}): {args.dist_url}', flush=True)
