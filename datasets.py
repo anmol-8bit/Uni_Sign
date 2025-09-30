@@ -452,6 +452,10 @@ class S2T_Dataset_news(Base_Dataset):
         if self.args.dataset == "CSL_News":
             self.pose_dir = pose_dirs[args.dataset]
             self.rgb_dir = rgb_dirs[args.dataset]
+
+        elif self.args.dataset == "YT-ASL":
+            self.pose_dir = pose_dirs[args.dataset]
+            self.rgb_dir = rgb_dirs[args.dataset]
         else:
             raise NotImplementedError
 
