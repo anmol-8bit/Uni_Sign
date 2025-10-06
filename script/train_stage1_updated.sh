@@ -9,7 +9,7 @@ set -euo pipefail
 GPUS="localhost:0,1,2,3,4,5,6,7"
 MASTER_PORT="${MASTER_PORT:-29511}"
 OUT_DIR="out/stage1_pretraining"
-DATASET="YT-ASL"
+DATASET="MERGED_ASL_CSL"
 
 # Effective batch = micro_batch_per_gpu * grad_accum * world_size
 MICRO_BSZ=48
@@ -30,7 +30,7 @@ QUICK_BREAK=2048              # periodic checkpoint trigger
 USE_WANDB=1                   # set 0 to disable
 WANDB_PROJECT="unisign"
 WANDB_ENTITY=""               # set if you use a team/org
-WANDB_RUN_NAME="stage1-pretrain-augmentations_arch2-asl"
+WANDB_RUN_NAME="stage1-pretrain-augmentations_arch2-asl_csl_merged"
 WANDB_GROUP="stage1"
 WANDB_TAGS="pretrain deepspeed bf16"
 WANDB_MODE="online"           # online|offline|disabled
@@ -39,7 +39,7 @@ WANDB_ID=""                   # set to resume a specific run id
 
 mkdir -p "${OUT_DIR}"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-LOGFILE="${OUT_DIR}/train_${TIMESTAMP}_augmentations_arch_2-asl.log"
+LOGFILE="${OUT_DIR}/train_${TIMESTAMP}_augmentations_arch_2-asl_csl_merged.log"
 
 # Reasonable defaults for a single host, 8x GPUs
 export TOKENIZERS_PARALLELISM=false

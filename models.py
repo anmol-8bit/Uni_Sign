@@ -377,9 +377,31 @@ class Uni_Sign(nn.Module):
         feats = feats + self.part_para                           # optional bias
         inputs_embeds = self.pose_proj(feats)                    # (B,T,768)
 
-        # ---- MT5 prefix + attention mask (kept) ----
+        # ---- MT5 prefix + attention mask (dynamic per-sample prompts) ----
+        batch_size = len(tgt_input["gt_sentence"])
+
+        # Check if we have per-sample language info
+        if 'languages' in tgt_input and tgt_input['languages'][0] is not None:
+            # Dynamic per-sample prompts for mixed-language batches
+            # Handle "Unknown" -> fallback to self.lang
+            prompts = [
+                f"Translate sign language video to {lang if lang != 'Unknown' else self.lang}: "
+                for lang in tgt_input['languages']
+            ]
+            # Debug: Log language distribution in first few batches
+            if not hasattr(self, '_lang_logged'):
+                self._lang_logged = True
+                lang_counts = {}
+                for lang in tgt_input['languages']:
+                    lang_counts[lang] = lang_counts.get(lang, 0) + 1
+                print(f"[PROMPT DEBUG] Batch languages: {lang_counts}")
+                print(f"[PROMPT DEBUG] Sample prompts: {prompts[:3]}")
+        else:
+            # Fallback for datasets without language field (CSL_Daily, WLASL)
+            prompts = [f"Translate sign language video to {self.lang}: "] * batch_size
+
         prefix_token = self.mt5_tokenizer(
-            [f"Translate sign language video to {self.lang}: "] * len(tgt_input["gt_sentence"]),
+            prompts,
             padding="longest", truncation=True, return_tensors="pt",
         ).to(inputs_embeds.device)
         prefix_embeds = self.mt5_model.encoder.embed_tokens(prefix_token['input_ids'])

@@ -300,13 +300,14 @@ def load_video_support_rgb(path, tmp):
 # -----------------------------
 class Base_Dataset(Dataset.Dataset):
     def collate_fn(self, batch):
-        tgt_batch, src_length_batch, name_batch, pose_tmp, gloss_batch = [], [], [], [], []
+        tgt_batch, src_length_batch, name_batch, pose_tmp, gloss_batch, language_batch = [], [], [], [], [], []
 
-        for name_sample, pose_sample, text, gloss, _ in batch:
+        for name_sample, pose_sample, text, gloss, _, language in batch:
             name_batch.append(name_sample)
             pose_tmp.append(pose_sample)
             tgt_batch.append(text)
             gloss_batch.append(gloss)
+            language_batch.append(language)
 
         src_input = {}
 
@@ -335,8 +336,8 @@ class Base_Dataset(Dataset.Dataset):
                 src_input['src_length_batch'] = src_length_batch
 
         if getattr(self, "rgb_support", False):
-            support_rgb_dicts = {key: [] for key in batch[0][-1].keys()}
-            for _, _, _, _, support_rgb_dict in batch:
+            support_rgb_dicts = {key: [] for key in batch[0][-2].keys()}
+            for _, _, _, _, support_rgb_dict, _ in batch:
                 for key in support_rgb_dict.keys():
                     support_rgb_dicts[key].append(support_rgb_dict[key])
 
@@ -355,7 +356,11 @@ class Base_Dataset(Dataset.Dataset):
                 src_input[rgb_key] = img_batch
                 src_input[len_key] = [len(index) for index in support_rgb_dicts[index_key]]
 
-        tgt_input = {'gt_sentence': tgt_batch, 'gt_gloss': gloss_batch}
+        tgt_input = {
+            'gt_sentence': tgt_batch,
+            'gt_gloss': gloss_batch,
+            'languages': language_batch
+        }
         return src_input, tgt_input
 
 
@@ -397,7 +402,7 @@ class S2T_Dataset(Base_Dataset):
         gloss = " ".join(sample['gloss']) if "gloss" in sample else ''
         name_sample = sample['name']
         pose_sample, support_rgb_dict = self.load_pose(sample['video_path'])
-        return name_sample, pose_sample, text, gloss, support_rgb_dict
+        return name_sample, pose_sample, text, gloss, support_rgb_dict, None
 
     def load_pose(self, path):
         pose = pickle.load(open(os.path.join(self.pose_dir, path.replace(".mp4", '.pkl')), 'rb'))
@@ -456,6 +461,10 @@ class S2T_Dataset_news(Base_Dataset):
         elif self.args.dataset == "YT-ASL":
             self.pose_dir = pose_dirs[args.dataset]
             self.rgb_dir = rgb_dirs[args.dataset]
+        
+        elif self.args.dataset == "MERGED_ASL_CSL":
+            self.pose_dir = pose_dirs[args.dataset]
+            self.rgb_dir = rgb_dirs[args.dataset]
         else:
             raise NotImplementedError
 
@@ -472,6 +481,17 @@ class S2T_Dataset_news(Base_Dataset):
             self.start_idx = int(sum_sample * 0.99)
             self.end_idx = int(sum_sample)
 
+        # Log language distribution for verification
+        if hasattr(self.annotation[0], 'get') or isinstance(self.annotation[0], dict):
+            lang_counts = {}
+            for sample in self.annotation[self.start_idx:self.end_idx]:
+                lang = sample.get('language', 'Unknown') if isinstance(sample, dict) else 'Unknown'
+                lang_counts[lang] = lang_counts.get(lang, 0) + 1
+            print(f"[DATASET INFO] {phase.upper()} split language distribution:")
+            for lang, count in sorted(lang_counts.items()):
+                pct = 100.0 * count / len(self.annotation[self.start_idx:self.end_idx])
+                print(f"  - {lang}: {count} samples ({pct:.2f}%)")
+
         # Augmentation progress (0..1), set by caller each epoch
         self.aug_progress = 0.0
 
@@ -487,6 +507,7 @@ class S2T_Dataset_news(Base_Dataset):
             sample = self.annotation[self.start_idx:self.end_idx][index]
             text = sample['text']
             name_sample = sample['video']
+            language = sample.get('language', None)
             try:
                 pose_sample, support_rgb_dict = self.load_pose(sample['pose'], sample['video'])
             except Exception:
@@ -500,7 +521,7 @@ class S2T_Dataset_news(Base_Dataset):
             raise RuntimeError(f"Failed to fetch video after {num_retries} retries.")
 
         # CSL_News has no gloss — return empty string for collate compatibility
-        return name_sample, pose_sample, text, '', support_rgb_dict
+        return name_sample, pose_sample, text, '', support_rgb_dict, language
 
     def load_pose(self, pose_name, rgb_name):
         pose = pickle.load(open(os.path.join(self.pose_dir, pose_name), 'rb'))
@@ -560,7 +581,7 @@ class S2T_Dataset_online(Base_Dataset):
         gloss = ''
         name_sample = 'online_data'
         pose_sample, support_rgb_dict = self.load_pose()
-        return name_sample, pose_sample, text, gloss, support_rgb_dict
+        return name_sample, pose_sample, text, gloss, support_rgb_dict, None
 
     def load_pose(self):
         pose = self.pose_data

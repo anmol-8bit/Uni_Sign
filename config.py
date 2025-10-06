@@ -2,6 +2,7 @@ mt5_path = "./pretrained_weight/mt5-base"
 
 # label paths
 train_label_paths = {
+                    "MERGED_ASL_CSL": "/data_benchmark/Uni-Sign/data/merged_output_filtered.json",
                     "YT-ASL":"/data_benchmark/Uni-Sign/data/filtered_json_file_asl.json",
                     #"CSL_News": "./data/CSL_News/CSL_News_Labels.json",
                     "CSL_News":"/data_benchmark/Uni-Sign/data/merged_output.json",
@@ -10,6 +11,7 @@ train_label_paths = {
                     }
 
 dev_label_paths = {
+                    "MERGED_ASL_CSL": "/data_benchmark/Uni-Sign/data/merged_output_filtered.json",
                     "YT-ASL":"/data_benchmark/Uni-Sign/data/filtered_json_file_asl.json",
                     #"CSL_News": "./data/CSL_News/CSL_News_Labels.json",
                     "CSL_News":"/data_benchmark/Uni-Sign/data/merged_output.json",
@@ -18,6 +20,7 @@ dev_label_paths = {
                     }
 
 test_label_paths = {
+                    "MERGED_ASL_CSL": "/data_benchmark/Uni-Sign/data/merged_output_filtered.json",
                     "YT-ASL":"/data_benchmark/Uni-Sign/data/filtered_json_file_asl.json",
                     #"CSL_News": "./data/CSL_News/CSL_News_Labels.json",
                     "CSL_News":"/data_benchmark/Uni-Sign/data/merged_output.json",
@@ -28,6 +31,7 @@ test_label_paths = {
 
 # video paths
 rgb_dirs = {
+            "MERGED_ASL_CSL": "./dataset/merged/rgb_format",
             "YT-ASL":"./dataset/ASL/rgb_format",
             #"CSL_News": './dataset/CSL_News/rgb_format',
             "CSL_News": "./dataset/merged/rgb_format",
@@ -37,6 +41,7 @@ rgb_dirs = {
 
 # pose paths
 pose_dirs = {
+            "MERGED_ASL_CSL": "./dataset/merged/rgb_format",
             "YT-ASL":"./dataset/ASL/pose_format",
             #"CSL_News": './dataset/CSL_News/rgb_format',
             "CSL_News": "./dataset/merged/rgb_format",
