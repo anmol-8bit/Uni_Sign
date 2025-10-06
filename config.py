@@ -2,7 +2,7 @@ mt5_path = "./pretrained_weight/mt5-base"
 
 # label paths
 train_label_paths = {
-                    "YT-ASL":"/data_benchmark/Uni-Sign/data/yt_asl_only.cleaned.json",
+                    "YT-ASL":"/data_benchmark/Uni-Sign/data/filtered_json_file_asl.json",
                     #"CSL_News": "./data/CSL_News/CSL_News_Labels.json",
                     "CSL_News":"/data_benchmark/Uni-Sign/data/merged_output.json",
                     "CSL_Daily": "./data/CSL_Daily/labels.train",
@@ -10,7 +10,7 @@ train_label_paths = {
                     }
 
 dev_label_paths = {
-                    "YT-ASL":"/data_benchmark/Uni-Sign/data/yt_asl_only.cleaned.json",
+                    "YT-ASL":"/data_benchmark/Uni-Sign/data/filtered_json_file_asl.json",
                     #"CSL_News": "./data/CSL_News/CSL_News_Labels.json",
                     "CSL_News":"/data_benchmark/Uni-Sign/data/merged_output.json",
                     "CSL_Daily": "./data/CSL_Daily/labels.dev",
@@ -18,7 +18,7 @@ dev_label_paths = {
                     }
 
 test_label_paths = {
-                    "YT-ASL":"/data_benchmark/Uni-Sign/data/yt_asl_only.cleaned.json",
+                    "YT-ASL":"/data_benchmark/Uni-Sign/data/filtered_json_file_asl.json",
                     #"CSL_News": "./data/CSL_News/CSL_News_Labels.json",
                     "CSL_News":"/data_benchmark/Uni-Sign/data/merged_output.json",
                     "CSL_Daily": "./data/CSL_Daily/labels.test",

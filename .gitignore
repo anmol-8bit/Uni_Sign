@@ -24,3 +24,4 @@ yt_asl_validation_head200.csv
 .DS_Store
 app.log
 yt_asl_validation.csv
+*.csv
